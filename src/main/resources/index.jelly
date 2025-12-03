@@ -1,0 +1,11 @@
+<?jelly escape-by-default='true'?>
+<div style="background: #f5f5f5; padding: 15px; border-radius: 5px; margin-top: 20px;">
+    <p style="margin: 0 0 10px 0;">
+        <strong>Endpoint S3 SCM Plugin</strong>
+        v${it.version ?: '1.0.0'}
+    </p>
+    <p style="margin: 0; font-size: 12px; color: #666;">
+        Checkout Jenkins pipelines from S3 storage.
+        Works with MinIO, AWS S3, Ceph, and other S3-compatible services.
+    </p>
+</div>

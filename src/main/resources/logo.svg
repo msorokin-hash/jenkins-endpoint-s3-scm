@@ -1,0 +1,49 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img"
+     aria-labelledby="title desc">
+    <title id="title">Endpoint S3 SCM Plugin</title>
+    <desc id="desc">Icon representing S3 endpoint and zip download for Jenkins SCM plugin</desc>
+
+    <!-- Background rounded square -->
+    <rect x="8" y="8" width="112" height="112" rx="24" ry="24" fill="#1f2933"></rect>
+
+    <!-- S3-like "bucket" / endpoint circle -->
+    <circle cx="44" cy="48" r="20" fill="#f97316"></circle>
+
+    <!-- Three "endpoint dots" -->
+    <circle cx="36" cy="48" r="3.5" fill="#fefefe"></circle>
+    <circle cx="44" cy="48" r="3.5" fill="#fefefe"></circle>
+    <circle cx="52" cy="48" r="3.5" fill="#fefefe"></circle>
+
+    <!-- Cloud for storage -->
+    <path d="M78 38
+           c-6 0-11 4-12.5 9.5
+           c-5.5 0.7-9.5 5.2-9.5 10.5
+           c0 5.8 4.7 10.5 10.5 10.5h26
+           c5.8 0 10.5-4.7 10.5-10.5
+           c0-5.6-4.4-10.2-9.9-10.5
+           C90.5 42 84.8 38 78 38z" fill="#e5e7eb"></path>
+
+    <!-- ZIP / package rectangle -->
+    <rect x="40" y="68" width="48" height="32" rx="4" ry="4" fill="#111827" stroke="#e5e7eb" stroke-width="1.5"></rect>
+
+    <!-- ZIP teeth -->
+    <rect x="46" y="72" width="4" height="4" fill="#e5e7eb"></rect>
+    <rect x="52" y="72" width="4" height="4" fill="#e5e7eb"></rect>
+    <rect x="58" y="72" width="4" height="4" fill="#e5e7eb"></rect>
+
+    <!-- Divider line in the "zip" -->
+    <line x1="64" y1="70" x2="64" y2="98" stroke="#4b5563" stroke-width="1.5"></line>
+
+    <!-- Download arrow -->
+    <path d="M80 74 v12
+           m0 0 l-5 -5
+           m5 5 l5 -5" fill="none" stroke="#22c55e" stroke-width="2.2" stroke-linecap="round"
+          stroke-linejoin="round"></path>
+
+    <!-- Small label "S3" -->
+    <text x="44" y="88" text-anchor="middle"
+          font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="9"
+          fill="#e5e7eb" font-weight="600">
+        S3
+    </text>
+</svg>
