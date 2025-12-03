@@ -2,6 +2,7 @@
 
 <!-- Badges -->
 [![Jenkins Plugin](https://img.shields.io/badge/Jenkins-Plugin-blue?logo=jenkins)](https://plugins.jenkins.io/jenkins-endpoint-s3-scm)
+[![GitHub Release](https://img.shields.io/github/v/release/msorokin-hash/jenkins-endpoint-s3-scm?logo=github)](https://github.com/msorokin-hash/jenkins-endpoint-s3-scm/releases)
 ![Java 17+](https://img.shields.io/badge/Java-17%2B-orange)
 ![Jenkins 2.361+](https://img.shields.io/badge/Jenkins-2.361%2B-blue?logo=jenkins)
 ![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)
