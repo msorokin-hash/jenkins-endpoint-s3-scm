@@ -19,7 +19,7 @@
 
     <name>Endpoint S3 SCM Plugin</name>
     <description>SCM that checks out sources from an S3-compatible endpoint</description>
-    <url>https://github.com/your-org/endpoint-s3-scm-plugin</url>
+    <url>https://github.com/msorokin-hash/jenkins-endpoint-s3-scm</url>
 
     <licenses>
         <license>
@@ -43,15 +43,15 @@
     </developers>
 
     <scm>
-        <connection>scm:git:https://github.com/your-org/endpoint-s3-scm-plugin.git</connection>
-        <developerConnection>scm:git:git@github.com:your-org/endpoint-s3-scm-plugin.git</developerConnection>
-        <url>https://github.com/your-org/endpoint-s3-scm-plugin</url>
+        <connection>scm:git:https://github.com/msorokin-hash/jenkins-endpoint-s3-scm.git</connection>
+        <developerConnection>scm:git:git@github.com:msorokin-hash/jenkins-endpoint-s3-scm.git</developerConnection>
+        <url>https://github.com/msorokin-hash/jenkins-endpoint-s3-scm</url>
         <tag>HEAD</tag>
     </scm>
 
     <issueManagement>
         <system>GitHub Issues</system>
-        <url>https://github.com/your-org/endpoint-s3-scm-plugin/issues</url>
+        <url>https://github.com/msorokin-hash/jenkins-endpoint-s3-scm/issues</url>
     </issueManagement>
 
     <properties>
