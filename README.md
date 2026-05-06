@@ -7,153 +7,173 @@
 ![Jenkins 2.361+](https://img.shields.io/badge/Jenkins-2.361%2B-blue?logo=jenkins)
 ![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)
 ![LGPL v3 License](https://img.shields.io/badge/License-LGPL%20v3-blue.svg)
-[![Issues](https://img.shields.io/github/issues/msorokin-hash/jenkins-endpoint-s3-scm)](https://github.com/msorokin-hash/jenkins-endpoint-s3-scm/issues)
 
 ---
 
 ## Overview
 
-The **Endpoint S3 SCM Plugin** allows Jenkins jobs to fetch source files or build artifacts from **ZIP archives stored
-in S3-compatible object storage**.  
-Instead of cloning repositories such as Git or Subversion, this plugin downloads a ZIP file from an S3 endpoint (AWS S3,
-MinIO, Ceph, or any S3-compatible service), validates the archive, and safely extracts its contents into the Jenkins
-workspace.
+The **Endpoint S3 SCM Plugin** allows Jenkins to fetch build inputs from  
+**ZIP archives stored in S3-compatible object storage**.
 
-This SCM is ideal for environments where:
+Instead of cloning repositories (Git, SVN), the plugin:
 
-- Code or build inputs are delivered as archive bundles
-- Network restrictions prevent using traditional SCM systems
-- Builds depend on pre-packaged artifacts stored in S3
-- On-premises S3-compatible systems (MinIO, Ceph RGW, etc.) are used
-
-The plugin integrates with any Jenkins job type supporting custom SCM definitions.
+1. Searches a configured **S3 prefix**
+2. Finds the **latest ZIP archive**
+3. Downloads it with retry logic
+4. Safely extracts it into the workspace
 
 ---
 
 ## Features
 
-- **S3-Compatible Storage Support**  
-  Works with AWS S3, MinIO, Ceph, and custom S3 endpoints.
+- ✅ S3-compatible storage (AWS S3, MinIO, Ceph, LocalStack)
+- ✅ Latest ZIP auto-detection (by lastModified)
+- ✅ Multi-source failover (priority-based)
+- ✅ Retry logic with backoff
+- ✅ Secure ZIP extraction (Zip Slip protection)
+- ✅ Optional top-level directory stripping
+- ✅ Workspace cleanup on failure
+- ✅ Environment variables export
 
-- **ZIP Archive Checkout**  
-  Downloads `.zip` archives and extracts them directly into the workspace.
+---
 
-- **Credential-Based Authentication**  
-  Uses Jenkins Credentials Store:
-    - Username → Access Key
-    - Password → Secret Key
+## How It Works
 
-- **Object Metadata Validation**  
-  Uses a `HEAD` request to verify the object exists and check its size before downloading.
+1. Locations are sorted by priority (lower = first)
+2. For each location:
+    - List objects in prefix
+    - Filter `.zip`
+    - Select latest
+3. Download archive
+4. Validate ZIP
+5. Extract into workspace
+6. Stop on first success
 
-- **Secure ZIP Extraction**  
-  Protects against invalid ZIP structures and path traversal vulnerabilities.
+---
 
-- **Optional Top-Level Directory Stripping**  
-  Removes the first directory level inside the archive if needed.
+## Pipeline Usage
 
-- **Configurable Retry Logic**  
-  Customizable retry count and delay for unstable networks.
+### Single Source
 
-- **Workspace Cleanup on Failure**  
-  Prevents partial file extractions from remaining after errors.
+```groovy
+checkout([$class: 'EndpointS3SCM',
+    prefix: 'myapp/releases/',
+    locations: [[
+        name: 'primary',
+        endpoint: 'http://minio.internal:9000',
+        bucket: 'jenkins-pipelines',
+        credentialsId: 'minio-access',
+        region: 'us-east-1',
+        priority: 10
+    ]],
+    stripTopLevelDir: true
+])
+```
 
-- **Environment Variable Injection**  
-  Makes S3 settings available to build steps:
-    - `ENDPOINT_S3_ENDPOINT`
-    - `ENDPOINT_S3_BUCKET`
-    - `ENDPOINT_S3_KEY`
-    - `ENDPOINT_S3_REGION`
-    - `ENDPOINT_S3_CREDENTIALS_ID`
+---
+
+### Multi-Source (Failover)
+
+```groovy
+checkout([$class: 'EndpointS3SCM',
+    prefix: 'prod/deploy/',
+    locations: [
+        [
+            name: 'primary',
+            endpoint: 'https://s3-primary.example.com',
+            bucket: 'pipelines-primary',
+            credentialsId: 'creds-primary',
+            priority: 10
+        ],
+        [
+            name: 'backup',
+            endpoint: 'https://s3-backup.example.com',
+            bucket: 'pipelines-backup',
+            credentialsId: 'creds-backup',
+            priority: 20
+        ]
+    ],
+    maxRetries: 5,
+    retryDelayMs: 2000
+])
+```
+
+---
+
+## Parameters
+
+### Root
+
+| Parameter | Description | Required |
+|----------|------------|----------|
+| prefix | S3 prefix to search ZIP files | ✅ |
+| locations | List of sources | ✅ |
+| stripTopLevelDir | Remove root folder | ❌ |
+| maxRetries | Retry attempts | ❌ |
+| retryDelayMs | Delay between retries | ❌ |
+
+---
+
+### Location
+
+| Parameter | Description | Required |
+|----------|------------|----------|
+| name | Optional name | ❌ |
+| endpoint | S3 endpoint URL | ✅ |
+| bucket | Bucket name | ✅ |
+| credentialsId | Jenkins credentials | ✅ |
+| region | AWS region | ❌ |
+| priority | Lower = higher priority | ❌ |
+
+---
+
+## Environment Variables
+
+```
+ENDPOINT_S3_PREFIX
+ENDPOINT_S3_LOCATIONS_COUNT
+ENDPOINT_S3_LOCATION_0_NAME
+ENDPOINT_S3_LOCATION_0_ENDPOINT
+ENDPOINT_S3_LOCATION_0_BUCKET
+ENDPOINT_S3_LOCATION_0_REGION
+ENDPOINT_S3_LOCATION_0_CREDENTIALS_ID
+ENDPOINT_S3_LOCATION_0_PRIORITY
+```
 
 ---
 
 ## Limitations
 
-- **Polling Not Supported**  
-  The plugin cannot detect changes in S3 buckets; builds must be triggered manually or by an external event.
-
-- **ZIP-Only Support**  
-  Other archive formats (e.g., TAR, TGZ) are not supported.
-
-- **Maximum Object Size: 1 GB**  
-  Larger archives are rejected for performance and safety reasons.
-
-- **Access Key / Secret Key Only**  
-  IAM roles, STS AssumeRole, and other AWS authentication methods are not supported.
-
-- **No Revision Tracking**  
-  S3 does not provide commit or version metadata; the plugin always performs a full checkout.
-
-- **No Incremental Deltas**  
-  The entire ZIP archive is downloaded for every build.
-
-- **SCM API Restrictions**  
-  No branches, tags, or commit browsing features are available.
+- ❌ No polling support
+- ❌ No changelog
+- ❌ ZIP only
+- ❌ No IAM roles
+- ❌ Max archive size: 1GB
 
 ---
 
-## Usage
+## Supported Storage
 
-### Freestyle Jobs
-
-In Freestyle jobs, select **Source Code Management → Endpoint S3 SCM**, then provide:
-
-- **Endpoint URL** – S3-compatible endpoint
-- **Bucket** – name of the S3 bucket
-- **Key** – path to the ZIP archive
-- **Credentials** – Jenkins Username/Password credentials (username = access key, password = secret key)
-- **Region** – optional AWS region
-- **Strip Top-Level Directory** – remove the root directory inside the ZIP
-
-After saving, the plugin will download and extract the archive during the `Checkout` phase.
+| Provider | Example |
+|--------|--------|
+| AWS S3 | https://s3.amazonaws.com |
+| MinIO | http://minio:9000 |
+| Ceph | http://ceph:8080 |
+| LocalStack | http://localhost:4566 |
 
 ---
 
-## Pipeline Example (Declarative)
+## Troubleshooting
 
-Below is a minimal working Pipeline configuration:
-
-```groovy
-pipeline {
-    agent any
-
-    stages {
-        stage('Checkout from S3') {
-            steps {
-                checkout([$class          : 'EndpointS3SCM',
-                          endpoint        : 'https://minio.example.com',
-                          bucket          : 'my-artifacts',
-                          key             : 'builds/project.zip',
-                          credentialsId   : 'minio-creds',
-                          region          : 'us-east-1',
-                          maxRetries      : 3,
-                          retryDelayMs    : 1000,
-                          stripTopLevelDir: true
-                ])
-            }
-        }
-
-        stage('Exec script') {
-            steps {
-                sh 'ls -la'
-                sh 'find . -type f | sort'
-            }
-        }
-    }
-}
-```
-
----
-
-## Contributing
-
-Pull requests are welcome!  
-Please include tests where appropriate and follow standard Jenkins plugin development conventions.
+| Error | Cause | Solution |
+|------|------|--------|
+| No ZIP files found | Empty prefix | Check uploads |
+| AccessDenied | Bad credentials | Fix permissions |
+| Archive too large | >1GB | Reduce size |
+| Jenkinsfile missing | Wrong ZIP structure | Fix archive |
 
 ---
 
 ## License
 
-This project is licensed under the **GNU Lesser General Public License v3 (LGPL-3.0)**.  
-See the **LICENSE** file for the full license text.
+LGPL v3

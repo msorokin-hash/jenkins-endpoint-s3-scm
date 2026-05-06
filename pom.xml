@@ -14,7 +14,7 @@
     </parent>
 
     <artifactId>endpoint-s3-scm-plugin</artifactId>
-    <version>1.0.0</version>
+    <version>1.1.0</version>
     <packaging>hpi</packaging>
 
     <name>Endpoint S3 SCM Plugin</name>
@@ -58,6 +58,7 @@
         <jenkins.version>2.414.3</jenkins.version>
         <java.level>17</java.level>
         <hpi.compatibleSinceVersion>0.0.1</hpi.compatibleSinceVersion>
+        <mockito-inline.version>5.2.0</mockito-inline.version>
         <aws.sdk.version>2.25.36</aws.sdk.version>
         <bom.version>2982.vdce2153031a_0</bom.version>
         <maven.surefire.plugin>3.2.5</maven.surefire.plugin>
@@ -130,6 +131,12 @@
         <dependency>
             <groupId>org.mockito</groupId>
             <artifactId>mockito-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-inline</artifactId>
+            <version>${mockito-inline.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

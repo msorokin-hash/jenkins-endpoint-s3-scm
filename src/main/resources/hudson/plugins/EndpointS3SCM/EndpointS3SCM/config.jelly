@@ -1,44 +1,35 @@
 <?jelly escape-by-default='true'?>
-<j:jelly xmlns:j="jelly:core"
-         xmlns:f="/lib/form">
+<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form" xmlns:st="jelly:stapler">
+    <style type="text/css">
+        .repeated-chunk__header {
+        background-color: #f8f9fa;
+        border-bottom: 1px solid #dcdcdc;
+        padding: 8px 15px !important;
+        font-weight: 600;
+        color: #333;
+        border-radius: 5px 5px 0 0;
+        }
+    </style>
 
-    <f:entry title="Endpoint" field="endpoint">
-        <f:textbox/>
-    </f:entry>
+    <f:section title="S3 Source Configuration">
+        <f:entry title="S3 locations">
+            <f:repeatable field="locations" add="Add S3 location" header="S3 Location" minimum="0">
+                <div class="jenkins-!-display-flex jenkins-!-flex-direction-column">
+                    <st:include page="config.jelly" class="${descriptor.clazz}"/>
+                </div>
+            </f:repeatable>
+        </f:entry>
 
-    <f:entry title="Bucket" field="bucket">
-        <f:textbox/>
-    </f:entry>
-
-    <f:entry title="Object key (path)" field="key">
-        <f:textbox/>
-    </f:entry>
-
-    <f:entry title="Region" field="region">
-        <f:textbox/>
-    </f:entry>
-
-    <f:entry title="Credentials" field="credentialsId">
-        <f:select/>
-    </f:entry>
-
-    <f:entry title="Strip top-level directory" field="stripTopLevelDir">
-        <f:checkbox default="true" checked="${instance != null ? instance.stripTopLevelDir : true}"/>
-    </f:entry>
-
-    <f:entry title="Max retries" field="maxRetries">
-        <f:number default="3"/>
-    </f:entry>
-
-    <f:entry title="Retry delay (ms)" field="retryDelayMs">
-        <f:number default="1000"/>
-    </f:entry>
-
-    <f:entry title="Test connection">
-        <f:validateButton
-                title="Test connection"
-                progress="Testing..."
-                method="testConnection"
-                with="endpoint,bucket,key,credentialsId,region"/>
-    </f:entry>
+        <f:advanced title="Global Checkout Settings">
+            <f:entry title="Strip top-level directory" field="stripTopLevelDir">
+                <f:checkbox default="true"/>
+            </f:entry>
+            <f:entry title="Max retries" field="maxRetries">
+                <f:number default="3"/>
+            </f:entry>
+            <f:entry title="Retry delay (ms)" field="retryDelayMs">
+                <f:number default="1000"/>
+            </f:entry>
+        </f:advanced>
+    </f:section>
 </j:jelly>

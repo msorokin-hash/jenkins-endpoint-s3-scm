@@ -21,12 +21,10 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 
-import static java.nio.file.Files.writeString;
-import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
-public class EndpointS3SCMTest {
+public class EndpointS3SCMFailoverTest {
 
     @Rule
     public TemporaryFolder temp = new TemporaryFolder();
@@ -41,35 +39,18 @@ public class EndpointS3SCMTest {
         return new StreamTaskListener(System.out, StandardCharsets.UTF_8);
     }
 
-    private UsernamePasswordCredentialsImpl creds() {
+    private UsernamePasswordCredentialsImpl creds(String id) {
         return new UsernamePasswordCredentialsImpl(
                 CredentialsScope.SYSTEM,
-                "creds-id",
+                id,
                 "desc",
-                "ACCESS_KEY",
-                "SECRET_KEY"
+                "ACCESS_" + id,
+                "SECRET_" + id
         );
     }
 
-    private EndpointS3SCM scmWithLocation(String name,
-                                          String endpoint,
-                                          String bucket,
-                                          String credentialsId,
-                                          int priority) {
-        S3Location location = new S3Location();
-        location.setBucket(bucket);
-        location.setName(name);
-        location.setEndpoint(endpoint);
-        location.setCredentialsId(credentialsId);
-        location.setPriority(priority);
-
-        EndpointS3SCM scm = new EndpointS3SCM("releases/");
-        scm.setLocations(List.of(location));
-        return scm;
-    }
-
     @Test
-    public void checkout_happyPath() throws Exception {
+    public void checkout_primaryFails_secondarySucceeds() throws Exception {
         File wsDir = temp.newFolder("workspace");
         FilePath workspace = new FilePath(wsDir);
 
@@ -77,40 +58,72 @@ public class EndpointS3SCMTest {
         Launcher launcher = mock(Launcher.class);
         TaskListener listener = newListener();
 
+        S3Location primary = new S3Location();
+        primary.setName("primary");
+        primary.setEndpoint("http://primary.example.com");
+        primary.setBucket("bucket-primary");
+        primary.setCredentialsId("primary-creds");
+        primary.setPriority(10);
+
+        S3Location secondary = new S3Location();
+        secondary.setName("secondary");
+        secondary.setEndpoint("http://secondary.example.com");
+        secondary.setBucket("bucket-secondary");
+        secondary.setCredentialsId("secondary-creds");
+        secondary.setPriority(20);
+
+        EndpointS3SCM scm = new EndpointS3SCM("releases/");
+        scm.setLocations(List.of(secondary, primary));
+
         try (MockedStatic<CredentialsHelper> credsStatic =
                      Mockito.mockStatic(CredentialsHelper.class)) {
 
-            credsStatic.when(() -> CredentialsHelper.lookupCredentialsForRun(run, "creds-id"))
-                    .thenReturn(creds());
+            credsStatic.when(() -> CredentialsHelper.lookupCredentialsForRun(run, "primary-creds"))
+                    .thenReturn(creds("primary-creds"));
+
+            credsStatic.when(() -> CredentialsHelper.lookupCredentialsForRun(run, "secondary-creds"))
+                    .thenReturn(creds("secondary-creds"));
 
             S3Service s3Service = mock(S3Service.class);
             ZipService zipService = mock(ZipService.class);
-            S3Client s3Client = mock(S3Client.class);
+
+            S3Client primaryClient = mock(S3Client.class);
+            S3Client secondaryClient = mock(S3Client.class);
 
             when(s3Service.createClient(
-                    "http://example.com",
+                    "http://primary.example.com",
                     null,
-                    "ACCESS_KEY",
-                    "SECRET_KEY"
-            )).thenReturn(s3Client);
+                    "ACCESS_primary-creds",
+                    "SECRET_primary-creds"
+            )).thenReturn(primaryClient);
+
+            when(s3Service.createClient(
+                    "http://secondary.example.com",
+                    null,
+                    "ACCESS_secondary-creds",
+                    "SECRET_secondary-creds"
+            )).thenReturn(secondaryClient);
+
+            when(s3Service.findLatestZipObject(primaryClient, "bucket-primary", "releases/"))
+                    .thenThrow(new RuntimeException("primary unavailable"));
 
             S3ObjectCandidate latest = new S3ObjectCandidate(
-                    "releases/key.zip",
+                    "releases/latest.zip",
                     1024L,
-                    Instant.parse("2025-01-01T10:00:00Z")
+                    Instant.parse("2025-01-02T10:00:00Z")
             );
 
-            when(s3Service.findLatestZipObject(s3Client, "bucket", "releases/"))
+            when(s3Service.findLatestZipObject(secondaryClient, "bucket-secondary", "releases/"))
                     .thenReturn(latest);
 
             doAnswer(invocation -> {
                 Path tempFile = invocation.getArgument(3);
-                writeString(tempFile, "dummy");
+                java.nio.file.Files.writeString(tempFile, "dummy");
                 return null;
             }).when(s3Service).getObject(
-                    eq(s3Client),
-                    eq("bucket"),
-                    eq("releases/key.zip"),
+                    eq(secondaryClient),
+                    eq("bucket-secondary"),
+                    eq("releases/latest.zip"),
                     any(Path.class),
                     anyInt(),
                     anyInt(),
@@ -128,45 +141,23 @@ public class EndpointS3SCMTest {
                             anyBoolean()
                     );
 
-            EndpointS3SCM scm = scmWithLocation(
-                    "primary",
-                    "http://example.com",
-                    "bucket",
-                    "creds-id",
-                    10
-            );
-
             injectField(scm, "s3Service", s3Service);
             injectField(scm, "zipService", zipService);
 
             scm.checkout(run, launcher, workspace, listener, null, null);
 
-            assertTrue(wsDir.exists());
-
-            verify(s3Service).createClient(
-                    "http://example.com",
-                    null,
-                    "ACCESS_KEY",
-                    "SECRET_KEY"
-            );
-
-            verify(s3Service).findLatestZipObject(
-                    s3Client,
-                    "bucket",
-                    "releases/"
-            );
+            verify(s3Service).findLatestZipObject(primaryClient, "bucket-primary", "releases/");
+            verify(s3Service).findLatestZipObject(secondaryClient, "bucket-secondary", "releases/");
 
             verify(s3Service).getObject(
-                    eq(s3Client),
-                    eq("bucket"),
-                    eq("releases/key.zip"),
+                    eq(secondaryClient),
+                    eq("bucket-secondary"),
+                    eq("releases/latest.zip"),
                     any(Path.class),
                     anyInt(),
                     anyInt(),
                     any(TaskListener.class)
             );
-
-            verify(zipService).validateZipFile(any(Path.class), any(TaskListener.class));
 
             verify(zipService).extractZipSecurely(
                     any(Path.class),

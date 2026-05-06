@@ -3,73 +3,81 @@ package hudson.plugins.EndpointS3SCM;
 import hudson.model.TaskListener;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
-import software.amazon.awssdk.core.ResponseInputStream;
-import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
 import software.amazon.awssdk.services.s3.S3Configuration;
-import software.amazon.awssdk.services.s3.model.*;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.S3Object;
 
 import java.io.IOException;
-import java.io.OutputStream;
-import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Comparator;
 
-import static hudson.plugins.EndpointS3SCM.PluginUtils.isEmpty;
 import static java.net.URI.create;
 
+/**
+ * Service responsible for S3-compatible storage operations.
+ * Optimized for S3-compatible systems like MinIO or Ceph using AWS SDK v2 features.
+ */
 public class S3Service {
 
     /**
-     * Creates and configures an S3 client for connecting to an S3-compatible storage endpoint.
-     * Supports custom endpoints (like MinIO, Ceph, etc.) with optional region configuration.
+     * Creates and configures an S3 client.
      *
-     * @param endpoint  The S3 service endpoint URL (e.g., "https://s3.amazonaws.com" or "http://localhost:9000")
-     * @param region    AWS region (optional, can be empty for non-AWS S3 implementations)
-     * @param accessKey AWS access key ID for authentication
-     * @param secretKey AWS secret access key for authentication
-     * @return Configured S3Client instance ready for use
+     * @param endpoint  S3-compatible endpoint URL
+     * @param region    AWS/S3 region, optional
+     * @param accessKey Access key
+     * @param secretKey Secret key
+     * @return Configured S3Client
      */
     public S3Client createClient(String endpoint,
                                  String region,
                                  String accessKey,
                                  String secretKey) {
-        AwsBasicCredentials creds = AwsBasicCredentials.create(accessKey, secretKey);
-
-        S3Configuration serviceConfiguration = S3Configuration.builder()
-                .pathStyleAccessEnabled(true)
+        S3ClientBuilder builder = S3Client.builder();
+        builder.endpointOverride(create(endpoint));
+        builder.region(PluginUtils.resolveRegion(region));
+        builder.credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey)));
+        builder.serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build());
+        return builder
                 .build();
-
-        S3ClientBuilder builder = S3Client.builder()
-                .endpointOverride(create(endpoint))
-                .credentialsProvider(StaticCredentialsProvider.create(creds))
-                .serviceConfiguration(serviceConfiguration);
-
-        if (!isEmpty(region)) {
-            try {
-                builder.region(Region.of(region));
-            } catch (Exception ignored) {
-                // Silently ignore invalid region - some S3 implementations don't require it
-            }
-        }
-
-        return builder.build();
     }
 
     /**
-     * Downloads an object from S3 storage to a local temporary file with retry logic.
-     * Implements exponential backoff retries for transient failures.
+     * Finds the latest ZIP object inside the specified S3 prefix using SDK Paginators and Streams.
      *
-     * @param s3           Configured S3 client instance
-     * @param bucket       S3 bucket name containing the object
-     * @param key          S3 object key (path) to download
-     * @param tempFile     Local file path where the object will be saved
-     * @param maxRetries   Maximum number of retry attempts for failed downloads
-     * @param retryDelayMs Base delay in milliseconds between retries (increases with each attempt)
-     * @param listener     Jenkins task listener for logging progress and errors
-     * @throws IOException          If an I/O error occurs during file operations
-     * @throws InterruptedException If the thread is interrupted during sleep between retries
-     * @throws S3Exception          If all retry attempts fail due to S3 errors
+     * @param s3     Configured S3 client
+     * @param bucket S3 bucket name
+     * @param prefix Directory/prefix to search in
+     * @return Latest ZIP object candidate or null if nothing was found
+     */
+    public S3ObjectCandidate findLatestZipObject(S3Client s3, String bucket, String prefix) {
+        return s3.listObjectsV2Paginator(b -> {
+                    b.bucket(bucket).prefix(PluginUtils.normalizePrefix(prefix));
+                })
+                .contents()
+                .stream()
+                .filter(obj -> obj.key() != null)
+                .filter(obj -> obj.lastModified() != null)
+                .filter(obj -> obj.size() != null && obj.size() > 0)
+                .filter(obj -> obj.key().toLowerCase().endsWith(".zip"))
+                .max(Comparator.comparing(S3Object::lastModified))
+                .map(obj -> new S3ObjectCandidate(obj.key(), obj.size(), obj.lastModified()))
+                .orElse(null);
+    }
+
+    /**
+     * Downloads an S3 object to a local file with retry logic using native SDK Path transfer.
+     *
+     * @param s3           Configured S3 client
+     * @param bucket       S3 bucket name
+     * @param key          S3 object key
+     * @param tempFile     Local temporary file path
+     * @param maxRetries   Max retry attempts
+     * @param retryDelayMs Base retry delay in milliseconds
+     * @param listener     Jenkins task listener
+     * @throws IOException          If file operations or final download attempt fails
+     * @throws InterruptedException If retry sleep is interrupted
      */
     public void getObject(S3Client s3,
                           String bucket,
@@ -80,76 +88,27 @@ public class S3Service {
                           TaskListener listener)
             throws IOException, InterruptedException {
 
-        GetObjectRequest request = GetObjectRequest.builder()
-                .bucket(bucket)
-                .key(key)
-                .build();
+        GetObjectRequest request = GetObjectRequest.builder().bucket(bucket).key(key).build();
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 if (attempt > 1) {
-                    listener.getLogger().printf(
-                            "[EndpointS3SCM] Download attempt %d of %d...%n",
-                            attempt, maxRetries
-                    );
+                    listener.getLogger().printf("[EndpointS3SCM] Download attempt %d of %d...%n", attempt, maxRetries);
                 }
 
-                try (ResponseInputStream<GetObjectResponse> in = s3.getObject(request);
-                     OutputStream out = Files.newOutputStream(tempFile)) {
-
-                    byte[] buffer = new byte[8192];
-                    int len;
-                    while ((len = in.read(buffer)) > 0) {
-                        out.write(buffer, 0, len);
-                    }
-                }
-
-                return; // Success - exit method
-
-            } catch (S3Exception e) {
-                if (attempt == maxRetries) {
-                    listener.error("[EndpointS3SCM] S3 error: " + e.getMessage());
-                    e.printStackTrace(listener.getLogger());
-                    throw e; // Re-throw after max retries
-                }
-                Thread.sleep((long) retryDelayMs * attempt); // Linear backoff
+                // Native SDK v2 method to download directly to a file (more efficient than manual stream copying)
+                s3.getObject(request, tempFile);
+                return;
 
             } catch (Exception e) {
                 if (attempt == maxRetries) {
-                    listener.error("[EndpointS3SCM] Download failed: " + e.getMessage());
-                    e.printStackTrace(listener.getLogger());
-                    throw e; // Re-throw after max retries
+                    listener.error("[EndpointS3SCM] Download failed after %d attempts: %s", maxRetries, e.getMessage());
+                    if (e instanceof IOException) throw (IOException) e;
+                    if (e instanceof InterruptedException) throw (InterruptedException) e;
+                    throw new IOException("Download failed", e);
                 }
-                Thread.sleep((long) retryDelayMs * attempt); // Linear backoff
+                Thread.sleep((long) retryDelayMs * attempt);
             }
-        }
-    }
-
-    /**
-     * Retrieves metadata about an S3 object without downloading its contents.
-     * Useful for checking object existence, size, last modified date, etc.
-     * Creates a temporary S3 client for a single operation.
-     *
-     * @param endpoint  S3 service endpoint URL
-     * @param region    AWS region (optional)
-     * @param bucket    S3 bucket name
-     * @param key       S3 object key (path)
-     * @param accessKey AWS access key ID
-     * @param secretKey AWS secret access key
-     * @return HeadObjectResponse containing object metadata, or throws S3Exception if object doesn't exist
-     */
-    public HeadObjectResponse headObject(String endpoint,
-                                         String region,
-                                         String bucket,
-                                         String key,
-                                         String accessKey,
-                                         String secretKey) {
-        try (S3Client s3 = createClient(endpoint, region, accessKey, secretKey)) {
-            HeadObjectRequest request = HeadObjectRequest.builder()
-                    .bucket(bucket)
-                    .key(key)
-                    .build();
-            return s3.headObject(request);
         }
     }
 }
