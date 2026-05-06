@@ -9,95 +9,110 @@ import hudson.Launcher;
 import hudson.Util;
 import hudson.model.Run;
 import hudson.model.TaskListener;
-import hudson.scm.*;
+import hudson.scm.ChangeLogParser;
+import hudson.scm.NullChangeLogParser;
+import hudson.scm.SCM;
+import hudson.scm.SCMRevisionState;
+import hudson.util.Secret;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
-import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
-import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
-import software.amazon.awssdk.services.s3.model.S3Exception;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Map;
+import java.util.*;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static hudson.plugins.EndpointS3SCM.PluginUtils.isEmpty;
 import static hudson.plugins.EndpointS3SCM.PluginUtils.maskUrl;
-import static java.net.URI.create;
 
 /**
- * Jenkins SCM implementation for downloading and extracting ZIP archives from S3-compatible storage.
- * This plugin enables Jenkins jobs to source their source code from ZIP files stored in S3,
- * supporting custom endpoints like MinIO, Ceph, and other S3-compatible services.
+ * Jenkins SCM implementation that retrieves the latest ZIP archive from S3-compatible storage.
  *
- * @author Mikhail Sorokin
+ * <p>This SCM is intended for workflows where source code or build artifacts are published
+ * as ZIP archives into S3-compatible storage, for example AWS S3, MinIO, Ceph or another
+ * compatible endpoint.</p>
+ *
+ * <p>The plugin supports multiple configured S3 locations. During checkout it sorts them
+ * by priority and tries each source until one succeeds. For every source it searches the
+ * latest non-empty {@code .zip} object inside the prefix configured for that specific
+ * location, downloads it, validates the archive and extracts it into the Jenkins workspace.</p>
+ *
+ * <p><b>Backward compatibility:</b> older job configurations may still contain a global
+ * {@code prefix} field. The current UI stores prefix inside each {@link S3Location}.
+ * The global prefix is kept only as a fallback for old saved configurations.</p>
  */
 public class EndpointS3SCM extends SCM {
 
-    /**
-     * Maximum size threshold for S3 objects (1GB).
-     * Objects larger than this will trigger an abort during checkout.
-     */
-    public static final long LARGE_OBJECT_WARNING_SIZE = 1_000_000_000L;
+    public static final long LARGE_OBJECT_WARNING_SIZE = 1_000_000_000L; // 1G
 
-    private final String endpoint;
-    private final String bucket;
-    private final String key;
+    private static final String LOG_PREFIX = "[EndpointS3SCM] ";
+
+    /**
+     * Legacy global prefix kept for backward compatibility with older job configurations.
+     */
+    private final String prefix;
+
     private final S3Service s3Service = new S3Service();
     private final ZipService zipService = new ZipService();
-    private String credentialsId;
-    private String region;
+    private final EndpointS3SCMConfigValidator configValidator = new EndpointS3SCMConfigValidator();
+
+    private List<S3Location> locations = new ArrayList<>();
     private int maxRetries = 3;
     private int retryDelayMs = 1000;
     private boolean stripTopLevelDir = true;
 
     /**
-     * Constructor for the SCM plugin with required parameters.
+     * Creates SCM configuration.
      *
-     * @param endpoint S3-compatible endpoint URL
-     * @param bucket   S3 bucket name containing the ZIP archive
-     * @param key      S3 object key (path) to the ZIP file
+     * @param prefix legacy global S3 prefix, may be null
      */
     @DataBoundConstructor
-    public EndpointS3SCM(String endpoint, String bucket, String key) {
-        this.endpoint = Util.fixEmptyAndTrim(endpoint);
-        this.bucket = Util.fixEmptyAndTrim(bucket);
-        this.key = Util.fixEmptyAndTrim(key);
+    public EndpointS3SCM(String prefix) {
+        this.prefix = Util.fixEmptyAndTrim(prefix);
     }
 
-    public String getEndpoint() {
-        return endpoint;
+    /**
+     * Returns legacy global S3 prefix.
+     *
+     * @return legacy global prefix, or null
+     */
+    public String getPrefix() {
+        return prefix;
     }
 
-    public String getBucket() {
-        return bucket;
-    }
-
+    /**
+     * Returns configured S3 source locations.
+     *
+     * @return unmodifiable list of S3 locations
+     */
     @NonNull
-    public String getKey() {
-        return key;
+    public List<S3Location> getLocations() {
+        return locations != null
+                ? Collections.unmodifiableList(locations)
+                : Collections.emptyList();
     }
 
-    public String getCredentialsId() {
-        return credentialsId;
-    }
-
+    /**
+     * Sets S3 source locations.
+     *
+     * <p>Locations are normalized by removing null entries and sorting by priority.</p>
+     *
+     * @param locations S3 locations
+     */
     @DataBoundSetter
-    public void setCredentialsId(String credentialsId) {
-        this.credentialsId = Util.fixEmptyAndTrim(credentialsId);
-    }
-
-    public String getRegion() {
-        return region;
-    }
-
-    @DataBoundSetter
-    public void setRegion(String region) {
-        this.region = Util.fixEmptyAndTrim(region);
+    public void setLocations(List<S3Location> locations) {
+        this.locations = locations == null
+                ? new ArrayList<>()
+                : locations.stream()
+                .filter(Objects::nonNull)
+                .sorted(Comparator.comparingInt(S3Location::getPriority))
+                .collect(Collectors.toCollection(ArrayList::new));
     }
 
     public int getMaxRetries() {
@@ -105,8 +120,9 @@ public class EndpointS3SCM extends SCM {
     }
 
     /**
-     * Sets the maximum number of retry attempts for failed downloads.
-     * Clamped between 1 and 10 attempts.
+     * Sets maximum number of download retry attempts.
+     *
+     * @param maxRetries maximum retry attempts
      */
     @DataBoundSetter
     public void setMaxRetries(int maxRetries) {
@@ -118,8 +134,9 @@ public class EndpointS3SCM extends SCM {
     }
 
     /**
-     * Sets the base retry delay in milliseconds between download attempts.
-     * Clamped between 500ms and 30,000ms (30 seconds).
+     * Sets retry delay in milliseconds.
+     *
+     * @param retryDelayMs retry delay in milliseconds
      */
     @DataBoundSetter
     public void setRetryDelayMs(int retryDelayMs) {
@@ -130,22 +147,26 @@ public class EndpointS3SCM extends SCM {
         return stripTopLevelDir;
     }
 
+    /**
+     * Controls whether common top-level directory in ZIP archive should be stripped.
+     *
+     * @param stripTopLevelDir true to strip common top-level directory
+     */
     @DataBoundSetter
     public void setStripTopLevelDir(boolean stripTopLevelDir) {
         this.stripTopLevelDir = stripTopLevelDir;
     }
 
     /**
-     * Main checkout method called by Jenkins during build execution.
-     * Downloads a ZIP file from S3, validates it, and extracts it securely to the workspace.
+     * Performs Jenkins SCM checkout.
      *
-     * @param build         Current Jenkins build context
-     * @param launcher      Jenkins launcher for executing processes
-     * @param workspace     Jenkins workspace directory where files will be extracted
-     * @param listener      Build listener for logging
-     * @param changelogFile File to write changelog information (unused for this SCM)
-     * @param baseline      Baseline revision state (unused for this SCM)
-     * @throws IOException If checkout fails due to I/O errors, network issues, or security violations
+     * @param build         current Jenkins build
+     * @param launcher      Jenkins launcher
+     * @param workspace     Jenkins workspace
+     * @param listener      build listener
+     * @param changelogFile changelog file, unused
+     * @param baseline      SCM revision baseline, unused
+     * @throws IOException if checkout fails
      */
     @Override
     public void checkout(@NonNull Run<?, ?> build,
@@ -155,238 +176,292 @@ public class EndpointS3SCM extends SCM {
                          File changelogFile,
                          SCMRevisionState baseline) throws IOException {
 
-        validateConfig();
+        configValidator.validate(this);
 
-        var log = listener.getLogger();
-        log.println("[EndpointS3SCM] Checkout from S3-compatible endpoint");
-        log.printf("[EndpointS3SCM] endpoint: %s, bucket: %s%n", maskUrl(endpoint), bucket);
-        log.printf("[EndpointS3SCM] key: %s%n", key);
-        if (!isEmpty(region)) {
-            log.printf("[EndpointS3SCM] region: %s%n", region);
-        }
-        log.printf("[EndpointS3SCM] maxRetries: %d, retryDelayMs: %dms%n", maxRetries, retryDelayMs);
-        log.printf("[EndpointS3SCM] stripTopLevelDir: %s%n", stripTopLevelDir);
+        PrintStream log = listener.getLogger();
 
-        // Retrieve credentials from Jenkins credentials store
-        StandardUsernamePasswordCredentials creds =
-                CredentialsHelper.lookupCredentialsForRun(build, credentialsId);
-        if (creds == null) {
-            throw new AbortException("[EndpointS3SCM] Cannot find credentials with id: " + credentialsId);
-        }
-
-        validateCredentials(creds);
+        log.println(LOG_PREFIX + "Checkout from S3-compatible endpoint(s)");
+        log.println(LOG_PREFIX + "prefix is configured per S3 location");
+        log.printf(LOG_PREFIX + "maxRetries: %d, retryDelayMs: %dms%n", maxRetries, retryDelayMs);
+        log.printf(LOG_PREFIX + "stripTopLevelDir: %s%n", stripTopLevelDir);
 
         Path tempFile = null;
         boolean success = false;
+        List<String> errors = new ArrayList<>();
 
         try {
-            // Create temporary file for downloading the ZIP archive
             tempFile = Files.createTempFile("endpoint-s3scm-", ".zip");
 
-            String accessKey = creds.getUsername();
-            String secretKey = creds.getPassword().getPlainText();
+            for (S3Location location : getLocations()) {
+                String effectivePrefix = effectivePrefix(location);
 
-            // Create S3 client and perform operations
-            try (S3Client s3 = s3Service.createClient(endpoint, region, accessKey, secretKey)) {
-
-                log.println("[EndpointS3SCM] Checking object size before download...");
-
-                // Get object metadata to check size before downloading
-                HeadObjectRequest headReq = HeadObjectRequest.builder()
-                        .bucket(bucket)
-                        .key(key)
-                        .build();
-
-                HeadObjectResponse response;
                 try {
-                    response = s3.headObject(headReq);
-                } catch (NoSuchKeyException e) {
-                    throw new AbortException("[EndpointS3SCM] Object not found: " + key);
-                } catch (S3Exception e) {
-                    String msg = e.awsErrorDetails() != null
-                            ? e.awsErrorDetails().errorMessage()
-                            : e.getMessage();
-                    throw new AbortException("[EndpointS3SCM] Failed to read object metadata: " + msg);
+                    log.printf(
+                            LOG_PREFIX + "Trying source '%s': endpoint=%s, bucket=%s, prefix=%s, region=%s, priority=%d%n",
+                            safeLocationName(location),
+                            maskUrl(location.getEndpoint()),
+                            location.getBucket(),
+                            effectivePrefix,
+                            PluginUtils.resolveRegionId(location.getRegion()),
+                            location.getPriority()
+                    );
+
+                    S3ObjectCandidate downloadedObject =
+                            downloadLatestFromLocation(build, location, effectivePrefix, tempFile, listener);
+
+                    log.printf(
+                            LOG_PREFIX + "Download complete. Object='%s', size=%d bytes%n",
+                            downloadedObject.getKey(),
+                            Files.size(tempFile)
+                    );
+
+                    zipService.validateZipFile(tempFile, listener);
+
+                    workspace.mkdirs();
+                    workspace.deleteContents();
+
+                    log.println(LOG_PREFIX + "Extracting ZIP archive into workspace...");
+                    zipService.extractZipSecurely(tempFile, workspace, listener, stripTopLevelDir);
+
+                    log.printf(
+                            LOG_PREFIX + "Checkout finished successfully from source '%s'.%n",
+                            safeLocationName(location)
+                    );
+
+                    success = true;
+                    break;
+
+                } catch (Exception e) {
+                    String message = String.format(
+                            "Source '%s' failed: %s",
+                            safeLocationName(location),
+                            cleanErrorMessage(e)
+                    );
+
+                    errors.add(message);
+                    log.println(LOG_PREFIX + "ERROR: " + message);
                 }
-
-                long objectSize = response.contentLength();
-                log.printf("[EndpointS3SCM] Object size: %d bytes%n", objectSize);
-
-                // Check size limit before downloading
-                if (objectSize > LARGE_OBJECT_WARNING_SIZE) {
-                    throw new AbortException(String.format(
-                            "[EndpointS3SCM] Archive is too large (%d bytes). Maximum allowed size: %d bytes.",
-                            objectSize, LARGE_OBJECT_WARNING_SIZE
-                    ));
-                }
-
-                // Download the ZIP file from S3
-                log.println("[EndpointS3SCM] Downloading object from storage...");
-                s3Service.getObject(s3,
-                        bucket,
-                        key,
-                        tempFile,
-                        maxRetries,
-                        retryDelayMs,
-                        listener);
-
-                long size = Files.size(tempFile);
-                log.printf("[EndpointS3SCM] Download complete, size: %d bytes%n", size);
-
-                // Validate ZIP file structure
-                zipService.validateZipFile(tempFile, listener);
-
-                // Prepare workspace
-                workspace.mkdirs();
-                workspace.deleteContents();
-
-                // Extract ZIP archive with security protections
-                log.println("[EndpointS3SCM] Extracting ZIP archive into workspace (safe mode)...");
-                zipService.extractZipSecurely(tempFile, workspace, listener, stripTopLevelDir);
-
-                log.println("[EndpointS3SCM] Checkout finished successfully.");
-                success = true;
-
-
-            } catch (SdkException e) {
-                listener.error("[EndpointS3SCM] S3 client error: " + e.getMessage());
-                throw new IOException("S3 operation failed", e);
             }
+
+            if (!success) {
+                throw new AbortException(
+                        "All S3 sources failed:\n  - " + String.join("\n  - ", errors)
+                );
+            }
+
         } catch (AbortException e) {
-            listener.error("[EndpointS3SCM] Checkout aborted: " + e.getMessage());
             throw e;
         } catch (Exception e) {
-            listener.error("[EndpointS3SCM] Checkout failed: " + e.getMessage());
-            if (e.getCause() != null) {
-                listener.error("[EndpointS3SCM] Cause: " + e.getCause().getMessage());
-            }
+            listener.error(LOG_PREFIX + "Checkout failed: " + cleanErrorMessage(e));
             throw new IOException("Failed to checkout from S3-compatible endpoint", e);
         } finally {
-            // Clean up temporary file
-            if (tempFile != null) {
-                try {
-                    Files.deleteIfExists(tempFile);
-                } catch (IOException e) {
-                    log.printf("[EndpointS3SCM] Warning: cannot delete temp file %s: %s%n",
-                            tempFile, e.getMessage());
-                }
-            }
-
-            // Clean up workspace if checkout failed
-            if (!success) {
-                try {
-                    workspace.deleteContents();
-                    log.println("[EndpointS3SCM] Workspace cleaned up due to failed checkout.");
-                } catch (Exception e) {
-                    log.printf("[EndpointS3SCM] Warning: failed to clean workspace: %s%n", e.getMessage());
-                }
-            }
+            cleanup(tempFile, workspace, success, log);
         }
     }
 
     /**
-     * Indicates whether this SCM supports polling for changes.
-     * This implementation does not support polling.
+     * Downloads latest ZIP archive from one S3 location.
      *
-     * @return false - polling is not supported
+     * @param build    Jenkins build context
+     * @param location S3 source location
+     * @param prefix   prefix where ZIP archives are searched
+     * @param tempFile temporary target file
+     * @param listener Jenkins listener
+     * @return downloaded object metadata
+     * @throws AbortException       if checkout cannot continue
+     * @throws IOException          if S3 operation fails
+     * @throws InterruptedException if retry sleep is interrupted
      */
+    private S3ObjectCandidate downloadLatestFromLocation(@NonNull Run<?, ?> build,
+                                                         @NonNull S3Location location,
+                                                         @NonNull String prefix,
+                                                         @NonNull Path tempFile,
+                                                         @NonNull TaskListener listener)
+            throws IOException, AbortException, InterruptedException {
+
+        StandardUsernamePasswordCredentials credentials =
+                CredentialsHelper.lookupCredentialsForRun(build, location.getCredentialsId());
+
+        if (credentials == null) {
+            throw new AbortException("Cannot find credentials: " + location.getCredentialsId());
+        }
+
+        configValidator.validateCredentials(credentials);
+
+        try (S3Client s3 = s3Service.createClient(
+                location.getEndpoint(),
+                location.getRegion(),
+                credentials.getUsername(),
+                Secret.toString(credentials.getPassword())
+        )) {
+            PrintStream log = listener.getLogger();
+
+            log.printf(
+                    LOG_PREFIX + "Searching latest ZIP in bucket='%s', prefix='%s'%n",
+                    location.getBucket(),
+                    prefix
+            );
+
+            S3ObjectCandidate latest = s3Service.findLatestZipObject(s3, location.getBucket(), prefix);
+
+            if (latest == null) {
+                throw new AbortException("No ZIP files found in prefix: " + prefix);
+            }
+
+            log.printf(
+                    LOG_PREFIX + "Latest ZIP found: key='%s', size=%d bytes, lastModified=%s%n",
+                    latest.getKey(),
+                    latest.getSize(),
+                    latest.getLastModified()
+            );
+
+            if (latest.getSize() > LARGE_OBJECT_WARNING_SIZE) {
+                throw new AbortException(String.format(
+                        "Archive too large (%d bytes). Max: %d",
+                        latest.getSize(),
+                        LARGE_OBJECT_WARNING_SIZE
+                ));
+            }
+
+            Files.deleteIfExists(tempFile);
+
+            log.println(LOG_PREFIX + "Downloading object...");
+
+            s3Service.getObject(
+                    s3,
+                    location.getBucket(),
+                    latest.getKey(),
+                    tempFile,
+                    maxRetries,
+                    retryDelayMs,
+                    listener
+            );
+
+            return latest;
+
+        } catch (SdkException e) {
+            throw new IOException("S3 operation failed: " + cleanErrorMessage(e), e);
+        }
+    }
+
     @Override
     public boolean supportsPolling() {
         return false;
     }
 
     /**
-     * Adds S3 configuration as environment variables to the build.
-     * These variables can be used in subsequent build steps.
+     * Adds S3 configuration as build environment variables.
      *
-     * @param build Current Jenkins build
-     * @param env   Environment variables map to populate
+     * @param build current build
+     * @param env   environment variables map
      */
     @Override
-    public void buildEnvironment(@NonNull Run<?, ?> build,
-                                 @NonNull Map<String, String> env) {
-        env.put("ENDPOINT_S3_ENDPOINT", endpoint != null ? endpoint : "");
-        env.put("ENDPOINT_S3_BUCKET", bucket != null ? bucket : "");
-        env.put("ENDPOINT_S3_KEY", key != null ? key : "");
-        if (credentialsId != null) {
-            env.put("ENDPOINT_S3_CREDENTIALS_ID", credentialsId);
-        }
-        if (!isEmpty(region)) {
-            env.put("ENDPOINT_S3_REGION", region);
-        }
+    public void buildEnvironment(@NonNull Run<?, ?> build, @NonNull Map<String, String> env) {
+        env.put("ENDPOINT_S3_PREFIX", Objects.requireNonNullElse(prefix, ""));
+
+        List<S3Location> locs = getLocations();
+        env.put("ENDPOINT_S3_LOCATIONS_COUNT", String.valueOf(locs.size()));
+
+        IntStream.range(0, locs.size()).forEach(i -> {
+            S3Location location = locs.get(i);
+            String envPrefix = "ENDPOINT_S3_LOCATION_" + i + "_";
+
+            env.put(envPrefix + "NAME", Objects.requireNonNullElse(location.getName(), ""));
+            env.put(envPrefix + "ENDPOINT", Objects.requireNonNullElse(location.getEndpoint(), ""));
+            env.put(envPrefix + "BUCKET", Objects.requireNonNullElse(location.getBucket(), ""));
+            env.put(envPrefix + "PREFIX", Objects.requireNonNullElse(effectivePrefix(location), ""));
+            env.put(envPrefix + "REGION", Objects.requireNonNullElse(location.getRegion(), ""));
+            env.put(envPrefix + "CREDENTIALS_ID", Objects.requireNonNullElse(location.getCredentialsId(), ""));
+            env.put(envPrefix + "PRIORITY", String.valueOf(location.getPriority()));
+        });
     }
 
-    /**
-     * Creates a changelog parser for this SCM.
-     * Since this SCM doesn't track changes, returns a NullChangeLogParser.
-     *
-     * @return NullChangeLogParser instance
-     */
     @Override
     public ChangeLogParser createChangeLogParser() {
         return new NullChangeLogParser();
     }
 
-    /**
-     * Calculates revision state from the current build.
-     * Not implemented as this SCM doesn't track revisions.
-     *
-     * @return null - revision state not applicable
-     */
     @Override
     public SCMRevisionState calcRevisionsFromBuild(
             @NonNull Run<?, ?> build,
             @Nullable FilePath workspace,
             @Nullable Launcher launcher,
             @NonNull TaskListener listener) {
-
         return null;
     }
 
-    @Override
-    public SCMDescriptor<?> getDescriptor() {
-        return super.getDescriptor();
+    /**
+     * Resolves effective prefix for location.
+     *
+     * @param location S3 location
+     * @return location prefix or legacy global prefix
+     */
+    private String effectivePrefix(S3Location location) {
+        if (location != null && !isEmpty(location.getPrefix())) {
+            return location.getPrefix();
+        }
+
+        return prefix;
     }
 
     /**
-     * Validates the configuration parameters before proceeding with checkout.
+     * Returns human-readable location name for logs.
      *
-     * @throws AbortException If any required parameter is missing or invalid
+     * @param location S3 location
+     * @return location name or bucket name
      */
-    private void validateConfig() throws AbortException {
-        if (isEmpty(endpoint)) {
-            throw new AbortException("[EndpointS3SCM] Endpoint is required");
+    private String safeLocationName(S3Location location) {
+        if (location == null) {
+            return "unknown";
         }
 
-        try {
-            create(endpoint);
-        } catch (Exception e) {
-            throw new AbortException("[EndpointS3SCM] Invalid endpoint URL: " + endpoint);
-        }
-
-        if (isEmpty(bucket)) {
-            throw new AbortException("[EndpointS3SCM] Bucket is required");
-        }
-        if (isEmpty(key)) {
-            throw new AbortException("[EndpointS3SCM] Key is required");
-        }
-        if (isEmpty(credentialsId)) {
-            throw new AbortException("[EndpointS3SCM] Credentials are required");
-        }
+        return !isEmpty(location.getName())
+                ? location.getName()
+                : location.getBucket();
     }
 
     /**
-     * Validates that retrieved credentials contain both access key and secret.
+     * Normalizes exception message for Jenkins build log output.
      *
-     * @param creds Credentials retrieved from Jenkins credentials store
-     * @throws AbortException If credentials are missing username or password
+     * @param e exception
+     * @return cleaned error message
      */
-    private void validateCredentials(StandardUsernamePasswordCredentials creds) throws AbortException {
-        if (isEmpty(creds.getUsername())) {
-            throw new AbortException("[EndpointS3SCM] Selected credentials have empty username (access key)");
+    private String cleanErrorMessage(Exception e) {
+        String message = e.getMessage();
+
+        if (message == null || message.isBlank()) {
+            return e.getClass().getSimpleName();
         }
-        if (isEmpty(creds.getPassword().getPlainText())) {
-            throw new AbortException("[EndpointS3SCM] Selected credentials have empty password (secret)");
+
+        return message.replace(LOG_PREFIX, "").trim();
+    }
+
+    /**
+     * Cleans temporary file and workspace after checkout.
+     *
+     * @param tempFile  temporary downloaded ZIP file
+     * @param workspace Jenkins workspace
+     * @param success   whether checkout completed successfully
+     * @param log       logger
+     */
+    private void cleanup(Path tempFile, FilePath workspace, boolean success, PrintStream log) {
+        if (tempFile != null) {
+            try {
+                Files.deleteIfExists(tempFile);
+            } catch (IOException e) {
+                log.printf(LOG_PREFIX + "Warning: cannot delete temp file: %s%n", e.getMessage());
+            }
+        }
+
+        if (!success) {
+            try {
+                if (workspace != null && workspace.exists()) {
+                    workspace.deleteContents();
+                    log.println(LOG_PREFIX + "Workspace cleaned up due to failed checkout.");
+                }
+            } catch (Exception e) {
+                log.printf(LOG_PREFIX + "Warning: cleanup failed: %s%n", e.getMessage());
+            }
         }
     }
 }

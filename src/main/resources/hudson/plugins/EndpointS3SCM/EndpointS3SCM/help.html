@@ -3,85 +3,18 @@
 <head>
     <meta charset="UTF-8">
     <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-            line-height: 1.6;
-            color: #333;
-        }
-
-        .container {
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-
-        h1 {
-            color: #2c3e50;
-            border-bottom: 2px solid #4a90e2;
-            padding-bottom: 10px;
-        }
-
-        h2 {
-            color: #34495e;
-            margin-top: 30px;
-            padding-top: 15px;
-            border-top: 1px solid #eee;
-        }
-
-        h3 {
-            color: #2c3e50;
-            margin-top: 25px;
-        }
-
-        .code-block {
-            background: #f5f5f5;
-            border: 1px solid #ddd;
-            padding: 15px;
-            border-radius: 4px;
-            font-family: 'Monaco', 'Menlo', monospace;
-            font-size: 13px;
-            overflow-x: auto;
-            margin: 15px 0;
-        }
-
-        .note {
-            background: #e8f4fd;
-            border-left: 4px solid #4a90e2;
-            padding: 12px 15px;
-            margin: 20px 0;
-        }
-
-        .warning {
-            background: #fff3cd;
-            border-left: 4px solid #f0ad4e;
-            padding: 12px 15px;
-            margin: 20px 0;
-        }
-
-        table {
-            border-collapse: collapse;
-            width: 100%;
-            margin: 20px 0;
-        }
-
-        th {
-            background: #f8f9fa;
-            text-align: left;
-            padding: 12px;
-            border-bottom: 2px solid #dee2e6;
-            font-weight: 600;
-        }
-
-        td {
-            padding: 12px;
-            border-bottom: 1px solid #dee2e6;
-            vertical-align: top;
-        }
-
-        .param {
-            font-family: monospace;
-            color: #d14;
-        }
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 900px; margin: 0 auto; padding: 20px; }
+        h1 { color: #2c3e50; border-bottom: 2px solid #4a90e2; padding-bottom: 10px; }
+        h2 { color: #34495e; margin-top: 30px; padding-top: 15px; border-top: 1px solid #eee; }
+        h3 { color: #2c3e50; margin-top: 25px; }
+        .code-block { background: #f5f5f5; border: 1px solid #ddd; padding: 15px; border-radius: 4px; font-family: Monaco, Menlo, monospace; font-size: 13px; overflow-x: auto; margin: 15px 0; white-space: pre; }
+        .note { background: #e8f4fd; border-left: 4px solid #4a90e2; padding: 12px 15px; margin: 20px 0; }
+        .warning { background: #fff3cd; border-left: 4px solid #f0ad4e; padding: 12px 15px; margin: 20px 0; }
+        table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+        th { background: #f8f9fa; text-align: left; padding: 12px; border-bottom: 2px solid #dee2e6; font-weight: 600; }
+        td { padding: 12px; border-bottom: 1px solid #dee2e6; vertical-align: top; }
+        .param { font-family: monospace; color: #d14; }
     </style>
 </head>
 <body>
@@ -90,71 +23,86 @@
     <h1>Endpoint S3 SCM Plugin</h1>
 
     <p>
-        The <strong>Endpoint S3 SCM</strong> plugin allows Jenkins to download a ZIP archive
-        from S3-compatible storage and safely extract it into the job workspace.
-        It is designed for “checkout-only” scenarios where pipeline sources, shared libraries,
-        or configuration files are stored as ZIP archives in S3-like object storage.
+        The <strong>Endpoint S3 SCM</strong> plugin allows Jenkins to find the latest ZIP archive
+        in an S3-compatible storage prefix, download it, and safely extract it into the job workspace.
+        It is designed for checkout-only scenarios where pipeline sources, shared libraries,
+        or configuration files are published as ZIP archives in S3-like object storage.
     </p>
 
     <div class="note">
-        <strong>Plugin version:</strong>1.0<br>
-        <strong>Requires Jenkins:</strong>2.361.4+
+        <strong>Plugin version:</strong> 1.0<br>
+        <strong>Requires Jenkins:</strong> 2.361.4+
     </div>
 
     <h2>How it works</h2>
     <ul>
-        <li>Connects to a configured S3-compatible endpoint using username/password credentials (access key / secret
-            key).
-        </li>
-        <li>Performs a <strong>HEAD</strong> request to check object size before download.</li>
-        <li>Rejects objects larger than the built-in limit to avoid downloading huge archives.</li>
-        <li>Downloads the ZIP file to a temporary location with retry logic.</li>
+        <li>Uses one or more configured S3 locations.</li>
+        <li>Tries locations by priority: lower priority value is tried first.</li>
+        <li>Searches the configured <strong>prefix</strong> for non-empty <code>.zip</code> files.</li>
+        <li>Selects the latest ZIP archive by S3 <code>lastModified</code> timestamp.</li>
+        <li>Rejects archives larger than the built-in limit.</li>
+        <li>Downloads the selected ZIP file to a temporary location with retry logic.</li>
         <li>Validates the downloaded file as a ZIP archive.</li>
         <li>Safely extracts the ZIP into the workspace with Zip Slip protection.</li>
         <li>Optionally strips a common top-level directory from the archive.</li>
-        <li><strong>Removes the source ZIP from the workspace</strong> after extraction.</li>
-        <li>Does not support polling or changelog; this SCM is strictly “checkout-only”.</li>
+        <li>Does not support polling or changelog; this SCM is strictly checkout-only.</li>
     </ul>
 
     <h2>Pipeline usage</h2>
 
-    <h3>MinIO example</h3>
-    <div class="code-block">
-        checkout([$class: 'EndpointS3SCM',
+    <h3>Single MinIO location</h3>
+    <div class="code-block">checkout([$class: 'EndpointS3SCM',
+        prefix: 'myapp/releases/',
+        locations: [[
+        name: 'primary',
         endpoint: 'http://minio.internal:9000',
         bucket: 'jenkins-pipelines',
-        key: 'myapp/pipeline.zip',
         credentialsId: 'minio-access',
         region: 'us-east-1',
+        priority: 10
+        ]],
         stripTopLevelDir: true
-        ])
-    </div>
+        ])</div>
 
-    <h3>AWS S3 example</h3>
-    <div class="code-block">
-        checkout([$class: 'EndpointS3SCM',
-        endpoint: 'https://s3.eu-west-1.amazonaws.com',
-        bucket: 'company-pipelines',
-        key: 'prod/deploy.zip',
-        credentialsId: 'aws-jenkins',
-        region: 'eu-west-1',
-        stripTopLevelDir: true
-        ])
-    </div>
-
-    <h3>Custom retry settings</h3>
-    <div class="code-block">
-        checkout([$class: 'EndpointS3SCM',
-        endpoint: 'https://storage.example.com',
-        bucket: 'pipelines',
-        key: 'v1.2.3/build.zip',
-        credentialsId: 's3-access',
+    <h3>Two locations with failover</h3>
+    <div class="code-block">checkout([$class: 'EndpointS3SCM',
+        prefix: 'prod/deploy/',
+        locations: [
+        [
+        name: 'primary',
+        endpoint: 'https://s3-primary.example.com',
+        bucket: 'company-pipelines-primary',
+        credentialsId: 's3-primary-access',
         region: 'us-east-1',
+        priority: 10
+        ],
+        [
+        name: 'secondary',
+        endpoint: 'https://s3-secondary.example.com',
+        bucket: 'company-pipelines-secondary',
+        credentialsId: 's3-secondary-access',
+        region: 'us-east-1',
+        priority: 20
+        ]
+        ],
         stripTopLevelDir: true,
         maxRetries: 5,
         retryDelayMs: 2000
-        ])
-    </div>
+        ])</div>
+
+    <h3>AWS S3 example</h3>
+    <div class="code-block">checkout([$class: 'EndpointS3SCM',
+        prefix: 'releases/app/',
+        locations: [[
+        name: 'aws-eu',
+        endpoint: 'https://s3.eu-west-1.amazonaws.com',
+        bucket: 'company-pipelines',
+        credentialsId: 'aws-jenkins',
+        region: 'eu-west-1',
+        priority: 10
+        ]],
+        stripTopLevelDir: true
+        ])</div>
 
     <h2>Parameters</h2>
 
@@ -166,65 +114,86 @@
             <th>Default</th>
         </tr>
         <tr>
-            <td class="param">endpoint</td>
+            <td class="param">prefix</td>
+            <td>
+                S3 prefix/directory where ZIP archives are located.<br>
+                The plugin searches this prefix and selects the latest non-empty <code>.zip</code> object.
+            </td>
+            <td><strong>Yes</strong></td>
+            <td>–</td>
+        </tr>
+        <tr>
+            <td class="param">locations</td>
+            <td>
+                List of S3 source locations. Locations are tried by <code>priority</code>.
+                The first successful source is used.
+            </td>
+            <td><strong>Yes</strong></td>
+            <td>–</td>
+        </tr>
+        <tr>
+            <td class="param">locations[].name</td>
+            <td>Human-readable source name, for example <code>primary</code> or <code>secondary</code>.</td>
+            <td>No</td>
+            <td>Bucket name is used in logs</td>
+        </tr>
+        <tr>
+            <td class="param">locations[].endpoint</td>
             <td>
                 Full S3-compatible endpoint URL.<br>
                 Examples:<br>
                 <code>http://minio:9000</code><br>
                 <code>https://s3.amazonaws.com</code><br>
-                <code>https://s3.eu-west-1.amazonaws.com</code><br><br>
-                <strong>Must be specified for all providers, including AWS S3.</strong>
+                <code>https://s3.eu-west-1.amazonaws.com</code>
             </td>
             <td><strong>Yes</strong></td>
             <td>–</td>
         </tr>
         <tr>
-            <td class="param">bucket</td>
-            <td>S3 bucket name.</td>
+            <td class="param">locations[].bucket</td>
+            <td>S3 bucket name for this source.</td>
             <td><strong>Yes</strong></td>
             <td>–</td>
         </tr>
         <tr>
-            <td class="param">key</td>
-            <td>Object key (path to the ZIP file inside the bucket).</td>
-            <td><strong>Yes</strong></td>
-            <td>–</td>
-        </tr>
-        <tr>
-            <td class="param">credentialsId</td>
+            <td class="param">locations[].credentialsId</td>
             <td>
-                Jenkins credentials ID. Must be of type <em>“Username with password”</em>.<br>
+                Jenkins credentials ID. Must be of type <em>Username with password</em>.<br>
                 Username is used as <strong>Access Key</strong>, password as <strong>Secret Key</strong>.
+                Credentials may be backed by Jenkins Credentials Store or HashiCorp Vault integration.
             </td>
             <td><strong>Yes</strong></td>
             <td>–</td>
         </tr>
         <tr>
-            <td class="param">region</td>
+            <td class="param">locations[].region</td>
             <td>
-                Optional region string for AWS or S3-compatible providers.<br>
-                Example: <code>us-east-1</code>, <code>eu-west-1</code>.<br>
-                Some S3-compatible storages ignore this value.
+                Region string for AWS or S3-compatible providers.<br>
+                If omitted, the plugin uses <code>us-east-1</code>.
             </td>
             <td>No</td>
-            <td>Empty</td>
+            <td><code>us-east-1</code></td>
+        </tr>
+        <tr>
+            <td class="param">locations[].priority</td>
+            <td>
+                Source priority. Lower value is tried first.
+            </td>
+            <td>No</td>
+            <td>100</td>
         </tr>
         <tr>
             <td class="param">stripTopLevelDir</td>
             <td>
                 If enabled, the plugin attempts to detect a single common top-level directory
-                (e.g. <code>myapp/...</code>) and strip it, so files are placed directly into the workspace root.<br>
-                If no common top-level directory is found, extraction proceeds as-is.
+                and strip it, so files are placed directly into the workspace root.
             </td>
             <td>No</td>
             <td>true</td>
         </tr>
         <tr>
             <td class="param">maxRetries</td>
-            <td>
-                Maximum number of retry attempts for download failures from S3.
-                The delay grows linearly with attempt number.
-            </td>
+            <td>Maximum number of retry attempts for download failures.</td>
             <td>No</td>
             <td>3</td>
         </tr>
@@ -272,22 +241,22 @@
     <h2>Important notes</h2>
 
     <div class="warning">
-        <strong>Endpoint is always required.</strong><br>
-        The plugin does not assume AWS defaults; you must specify the full endpoint URL,
-        even for AWS S3.
+        <strong>The plugin downloads the latest ZIP by lastModified timestamp.</strong><br>
+        Make sure only valid release ZIP archives are placed in the configured prefix.
+        Non-ZIP files are ignored.
+    </div>
+
+    <div class="warning">
+        <strong>All configured buckets should be consistent.</strong><br>
+        When multiple locations are configured, they should contain equivalent release archives
+        under the same prefix. During failover the plugin searches the selected source independently.
     </div>
 
     <div class="warning">
         <strong>Jenkinsfile must be reachable after extraction.</strong><br>
-        For <em>Pipeline script from SCM</em>, ensure that after extraction (and optional stripping)
+        For <em>Pipeline script from SCM</em>, ensure that after extraction and optional stripping
         the <code>Jenkinsfile</code> is located at the path configured in the job’s
-        <em>Script Path</em> (by default simply <code>Jenkinsfile</code> in the workspace root).
-    </div>
-
-    <div class="warning">
-        <strong>Source ZIP is removed from the workspace.</strong><br>
-        After successful extraction, the downloaded ZIP file (and self-contained ZIP copies
-        inside the archive matching the same key) are removed from the workspace to keep it clean.
+        <em>Script Path</em>.
     </div>
 
     <h2>Troubleshooting</h2>
@@ -299,39 +268,40 @@
             <th>Solution</th>
         </tr>
         <tr>
-            <td><code>Jenkinsfile not found</code></td>
-            <td>Jenkinsfile is not in the expected location after extraction.</td>
-            <td>
-                Check the archive structure.<br>
-                Enable <code>stripTopLevelDir</code> if you have a wrapper folder
-                (e.g. <code>myapp/Jenkinsfile</code>), or update the job’s Script Path.
-            </td>
+            <td><code>No ZIP files found in prefix</code></td>
+            <td>No non-empty <code>.zip</code> objects were found in the configured prefix.</td>
+            <td>Check the prefix and verify that release archives are uploaded there.</td>
         </tr>
         <tr>
-            <td><code>Archive is too large</code></td>
+            <td><code>All S3 sources failed</code></td>
+            <td>Every configured location failed during object search or download.</td>
+            <td>Check endpoints, buckets, credentials, network access and source priorities.</td>
+        </tr>
+        <tr>
+            <td><code>Jenkinsfile not found</code></td>
+            <td>Jenkinsfile is not in the expected location after extraction.</td>
+            <td>Check the archive structure, <code>stripTopLevelDir</code>, and job Script Path.</td>
+        </tr>
+        <tr>
+            <td><code>Archive too large</code></td>
             <td>Object size exceeds the plugin’s maximum allowed size.</td>
-            <td>Reduce the archive size or adjust the limit in plugin configuration.</td>
+            <td>Reduce the archive size or adjust the limit in plugin code.</td>
+        </tr>
+        <tr>
+            <td><code>AccessDenied</code> / HTTP 403</td>
+            <td>Credentials do not have permission to list or read objects.</td>
+            <td>Grant permissions for <code>ListBucket</code> and <code>GetObject</code>.</td>
         </tr>
         <tr>
             <td><code>Connection refused</code> / <code>Host unreachable</code></td>
             <td>Endpoint URL or network configuration is incorrect.</td>
-            <td>Verify endpoint, port, DNS and firewall settings.</td>
-        </tr>
-        <tr>
-            <td><code>AccessDenied</code> / HTTP 403</td>
-            <td>Provided credentials do not have permission to read the object.</td>
-            <td>Check bucket policy and credentials permissions.</td>
-        </tr>
-        <tr>
-            <td><code>NoSuchKey</code> / HTTP 404</td>
-            <td>Bucket or key is wrong.</td>
-            <td>Double-check bucket name and object key.</td>
+            <td>Verify endpoint, port, DNS, proxy and firewall settings.</td>
         </tr>
         <tr>
             <td>Workspace is empty in pipeline stages</td>
             <td>Only the internal <code>@script</code> workspace was populated.</td>
             <td>
-                For <em>Pipeline script from SCM</em>, add an explicit
+                For <em>Pipeline script from SCM</em>, add explicit
                 <code>checkout scm</code> or <code>checkout([$class: 'EndpointS3SCM', ...])</code>
                 inside a stage to populate the main workspace.
             </td>
