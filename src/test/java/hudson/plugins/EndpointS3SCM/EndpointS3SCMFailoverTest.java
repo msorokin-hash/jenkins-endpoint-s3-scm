@@ -3,37 +3,28 @@ package hudson.plugins.EndpointS3SCM;
 import com.cloudbees.plugins.credentials.CredentialsScope;
 import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl;
 import hudson.FilePath;
-import hudson.Launcher;
-import hudson.model.Run;
 import hudson.model.TaskListener;
+import hudson.plugins.EndpointS3SCM.checkout.ChecksumVerifier;
+import hudson.plugins.EndpointS3SCM.config.S3Location;
+import hudson.plugins.EndpointS3SCM.support.FakeS3Service;
+import hudson.plugins.EndpointS3SCM.support.FakeZipService;
 import hudson.util.StreamTaskListener;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
-import org.mockito.MockedStatic;
-import org.mockito.Mockito;
-import software.amazon.awssdk.services.s3.S3Client;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
-import java.io.File;
-import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.List;
 
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.*;
+import static org.junit.Assert.*;
 
+@DisplayName("EndpointS3SCM — multi-source failover")
 public class EndpointS3SCMFailoverTest {
 
-    @Rule
-    public TemporaryFolder temp = new TemporaryFolder();
-
-    private static void injectField(Object target, String fieldName, Object value) throws Exception {
-        Field field = target.getClass().getDeclaredField(fieldName);
-        field.setAccessible(true);
-        field.set(target, value);
-    }
+    @TempDir
+    Path tempDir;
 
     private TaskListener newListener() {
         return new StreamTaskListener(System.out, StandardCharsets.UTF_8);
@@ -41,22 +32,14 @@ public class EndpointS3SCMFailoverTest {
 
     private UsernamePasswordCredentialsImpl creds(String id) {
         return new UsernamePasswordCredentialsImpl(
-                CredentialsScope.SYSTEM,
-                id,
-                "desc",
-                "ACCESS_" + id,
-                "SECRET_" + id
-        );
+                CredentialsScope.SYSTEM, id, "desc", "ACCESS_" + id, "SECRET_" + id);
     }
 
     @Test
+    @DisplayName("checkout: primary source failure triggers fallback to secondary in priority order")
     public void checkout_primaryFails_secondarySucceeds() throws Exception {
-        File wsDir = temp.newFolder("workspace");
-        FilePath workspace = new FilePath(wsDir);
-
-        Run<?, ?> run = mock(Run.class);
-        Launcher launcher = mock(Launcher.class);
-        TaskListener listener = newListener();
+        Path wsDir = Files.createDirectory(tempDir.resolve("workspace"));
+        FilePath workspace = new FilePath(wsDir.toFile());
 
         S3Location primary = new S3Location();
         primary.setName("primary");
@@ -74,97 +57,79 @@ public class EndpointS3SCMFailoverTest {
 
         EndpointS3SCM scm = new EndpointS3SCM("releases/");
         scm.setLocations(List.of(secondary, primary));
+        scm.setCredentialLookup((run, id) -> creds(id));
 
-        try (MockedStatic<CredentialsHelper> credsStatic =
-                     Mockito.mockStatic(CredentialsHelper.class)) {
+        FakeS3Service s3 = new FakeS3Service();
+        FakeZipService zip = new FakeZipService();
 
-            credsStatic.when(() -> CredentialsHelper.lookupCredentialsForRun(run, "primary-creds"))
-                    .thenReturn(creds("primary-creds"));
+        s3.throwOnFindLatest("bucket-primary", new RuntimeException("primary unavailable"));
+        s3.putLatest("bucket-secondary", "releases/",
+                FakeS3Service.candidate("releases/latest.zip", 1024L));
 
-            credsStatic.when(() -> CredentialsHelper.lookupCredentialsForRun(run, "secondary-creds"))
-                    .thenReturn(creds("secondary-creds"));
+        scm.setS3Service(s3);
+        scm.setZipService(zip);
+        scm.setChecksumVerifier(new NoOpChecksumVerifier());
 
-            S3Service s3Service = mock(S3Service.class);
-            ZipService zipService = mock(ZipService.class);
+        scm.checkout(null, null, workspace, newListener(), null, null);
 
-            S3Client primaryClient = mock(S3Client.class);
-            S3Client secondaryClient = mock(S3Client.class);
+        assertEquals(2, s3.findLatestCallCount);
+        assertEquals("bucket-primary:releases/", s3.findLatestCalls.get(0));
+        assertEquals("bucket-secondary:releases/", s3.findLatestCalls.get(1));
 
-            when(s3Service.createClient(
-                    "http://primary.example.com",
-                    null,
-                    "ACCESS_primary-creds",
-                    "SECRET_primary-creds"
-            )).thenReturn(primaryClient);
+        assertEquals(1, s3.getObjectCallCount);
+        assertTrue(s3.getObjectCalls.contains("bucket-secondary:releases/latest.zip"));
+        assertEquals(1, zip.extractCount);
+    }
 
-            when(s3Service.createClient(
-                    "http://secondary.example.com",
-                    null,
-                    "ACCESS_secondary-creds",
-                    "SECRET_secondary-creds"
-            )).thenReturn(secondaryClient);
+    @Test
+    @DisplayName("checkout: all sources fail — AbortException thrown and workspace cleaned up")
+    public void checkout_allSourcesFail_abortsAndCleansWorkspace() throws Exception {
+        Path wsDir = Files.createDirectory(tempDir.resolve("ws-allfail"));
+        Files.writeString(wsDir.resolve("stale.txt"), "old");
+        FilePath workspace = new FilePath(wsDir.toFile());
 
-            when(s3Service.findLatestZipObject(primaryClient, "bucket-primary", "releases/"))
-                    .thenThrow(new RuntimeException("primary unavailable"));
+        S3Location primary = new S3Location();
+        primary.setName("primary");
+        primary.setEndpoint("http://primary.example.com");
+        primary.setBucket("bucket-primary");
+        primary.setCredentialsId("creds");
+        primary.setPriority(10);
 
-            S3ObjectCandidate latest = new S3ObjectCandidate(
-                    "releases/latest.zip",
-                    1024L,
-                    Instant.parse("2025-01-02T10:00:00Z")
-            );
+        S3Location secondary = new S3Location();
+        secondary.setName("secondary");
+        secondary.setEndpoint("http://secondary.example.com");
+        secondary.setBucket("bucket-secondary");
+        secondary.setCredentialsId("creds");
+        secondary.setPriority(20);
 
-            when(s3Service.findLatestZipObject(secondaryClient, "bucket-secondary", "releases/"))
-                    .thenReturn(latest);
+        EndpointS3SCM scm = new EndpointS3SCM("releases/");
+        scm.setLocations(List.of(primary, secondary));
+        scm.setCredentialLookup((run, id) -> creds(id));
 
-            doAnswer(invocation -> {
-                Path tempFile = invocation.getArgument(3);
-                java.nio.file.Files.writeString(tempFile, "dummy");
-                return null;
-            }).when(s3Service).getObject(
-                    eq(secondaryClient),
-                    eq("bucket-secondary"),
-                    eq("releases/latest.zip"),
-                    any(Path.class),
-                    anyInt(),
-                    anyInt(),
-                    any(TaskListener.class)
-            );
+        FakeS3Service s3 = new FakeS3Service();
+        s3.throwOnFindLatest("bucket-primary", new RuntimeException("primary down"));
+        s3.throwOnFindLatest("bucket-secondary", new RuntimeException("secondary down"));
 
-            doNothing().when(zipService)
-                    .validateZipFile(any(Path.class), any(TaskListener.class));
+        scm.setS3Service(s3);
+        scm.setZipService(new FakeZipService());
+        scm.setChecksumVerifier(new NoOpChecksumVerifier());
 
-            doNothing().when(zipService)
-                    .extractZipSecurely(
-                            any(Path.class),
-                            any(FilePath.class),
-                            any(TaskListener.class),
-                            anyBoolean()
-                    );
+        try {
+            scm.checkout(null, null, workspace, newListener(), null, null);
+            fail("Expected AbortException");
+        } catch (hudson.AbortException e) {
+            assertTrue(e.getMessage().contains("All S3 sources failed"));
+        }
 
-            injectField(scm, "s3Service", s3Service);
-            injectField(scm, "zipService", zipService);
+        assertFalse("Workspace must be cleaned after total failure",
+                wsDir.resolve("stale.txt").toFile().exists());
+    }
 
-            scm.checkout(run, launcher, workspace, listener, null, null);
-
-            verify(s3Service).findLatestZipObject(primaryClient, "bucket-primary", "releases/");
-            verify(s3Service).findLatestZipObject(secondaryClient, "bucket-secondary", "releases/");
-
-            verify(s3Service).getObject(
-                    eq(secondaryClient),
-                    eq("bucket-secondary"),
-                    eq("releases/latest.zip"),
-                    any(Path.class),
-                    anyInt(),
-                    anyInt(),
-                    any(TaskListener.class)
-            );
-
-            verify(zipService).extractZipSecurely(
-                    any(Path.class),
-                    eq(workspace),
-                    any(TaskListener.class),
-                    eq(true)
-            );
+    private static class NoOpChecksumVerifier extends ChecksumVerifier {
+        @Override
+        public void verify(software.amazon.awssdk.services.s3.S3Client s3,
+                           hudson.plugins.EndpointS3SCM.s3.S3Service s3Service, String bucket, String zipKey,
+                           java.nio.file.Path zipFile, java.io.PrintStream log) {
         }
     }
 }

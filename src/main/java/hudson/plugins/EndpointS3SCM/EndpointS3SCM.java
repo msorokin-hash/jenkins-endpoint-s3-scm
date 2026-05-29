@@ -7,17 +7,21 @@ import hudson.AbortException;
 import hudson.FilePath;
 import hudson.Launcher;
 import hudson.Util;
+import hudson.model.Job;
 import hudson.model.Run;
 import hudson.model.TaskListener;
-import hudson.scm.ChangeLogParser;
-import hudson.scm.NullChangeLogParser;
-import hudson.scm.SCM;
-import hudson.scm.SCMRevisionState;
-import hudson.util.Secret;
+import hudson.plugins.EndpointS3SCM.checkout.*;
+import hudson.plugins.EndpointS3SCM.config.CheckoutConfig;
+import hudson.plugins.EndpointS3SCM.config.CheckoutConfigResolver;
+import hudson.plugins.EndpointS3SCM.config.EndpointS3SCMConfigValidator;
+import hudson.plugins.EndpointS3SCM.config.S3Location;
+import hudson.plugins.EndpointS3SCM.s3.S3ArchiveDownloader;
+import hudson.plugins.EndpointS3SCM.s3.S3ObjectCandidate;
+import hudson.plugins.EndpointS3SCM.s3.S3PollingService;
+import hudson.plugins.EndpointS3SCM.s3.S3Service;
+import hudson.scm.*;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
-import software.amazon.awssdk.core.exception.SdkException;
-import software.amazon.awssdk.services.s3.S3Client;
 
 import java.io.File;
 import java.io.IOException;
@@ -25,149 +29,159 @@ import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-import static hudson.plugins.EndpointS3SCM.PluginUtils.isEmpty;
-import static hudson.plugins.EndpointS3SCM.PluginUtils.maskUrl;
+import static hudson.plugins.EndpointS3SCM.EndpointS3SCMConstants.*;
+import static hudson.plugins.EndpointS3SCM.util.PluginUtils.maskUrl;
+import static hudson.plugins.EndpointS3SCM.util.PluginUtils.resolveRegionId;
 
 /**
- * Jenkins SCM implementation that retrieves the latest ZIP archive from S3-compatible storage.
+ * Jenkins SCM implementation that retrieves ZIP archives from S3-compatible storage.
  *
- * <p>This SCM is intended for workflows where source code or build artifacts are published
- * as ZIP archives into S3-compatible storage, for example AWS S3, MinIO, Ceph or another
- * compatible endpoint.</p>
+ * <p>The {@code prefix} field supports Jenkins environment variable expansion and
+ * two operating modes:</p>
+ * <ul>
+ *   <li><b>Prefix mode</b> — value does not end with {@code .zip}; the plugin lists
+ *       objects and selects the latest ZIP by {@code lastModified}.</li>
+ *   <li><b>Exact ZIP mode</b> — value ends with {@code .zip}; the plugin downloads
+ *       that exact S3 object key.</li>
+ * </ul>
  *
- * <p>The plugin supports multiple configured S3 locations. During checkout it sorts them
- * by priority and tries each source until one succeeds. For every source it searches the
- * latest non-empty {@code .zip} object inside the prefix configured for that specific
- * location, downloads it, validates the archive and extracts it into the Jenkins workspace.</p>
- *
- * <p><b>Backward compatibility:</b> older job configurations may still contain a global
- * {@code prefix} field. The current UI stores prefix inside each {@link S3Location}.
- * The global prefix is kept only as a fallback for old saved configurations.</p>
+ * <p>S3 source locations are resolved from the nearest ancestor folder and then
+ * from global configuration as cascading fallback locations.</p>
  */
 public class EndpointS3SCM extends SCM {
 
-    public static final long LARGE_OBJECT_WARNING_SIZE = 1_000_000_000L; // 1G
-
-    private static final String LOG_PREFIX = "[EndpointS3SCM] ";
-
-    /**
-     * Legacy global prefix kept for backward compatibility with older job configurations.
-     */
     private final String prefix;
+    private String targetDirectory;
 
-    private final S3Service s3Service = new S3Service();
-    private final ZipService zipService = new ZipService();
-    private final EndpointS3SCMConfigValidator configValidator = new EndpointS3SCMConfigValidator();
+    // Transient service objects — stateless, never serialized.
+    // Recreated in readResolve() after XStream deserialization.
+    private transient EndpointS3SCMConfigValidator configValidator;
+    private transient CheckoutConfigResolver configResolver;
+    private transient PrefixResolver prefixResolver;
+    private transient S3Service s3Service;
+    private transient ZipService zipService;
+    private transient ChecksumVerifier checksumVerifier;
+    private transient S3ArchiveDownloader archiveDownloader;
+    private transient WorkspaceExtractor workspaceExtractor;
+    private transient S3PollingService pollingService;
 
-    private List<S3Location> locations = new ArrayList<>();
-    private int maxRetries = 3;
-    private int retryDelayMs = 1000;
-    private boolean stripTopLevelDir = true;
+    private transient List<S3Location> locationsOverride;
+
+    private transient BiFunction<Run<?, ?>, String, StandardUsernamePasswordCredentials> credentialLookup;
 
     /**
      * Creates SCM configuration.
      *
-     * @param prefix legacy global S3 prefix, may be null
+     * @param prefix job-level Directory / Prefix value
      */
     @DataBoundConstructor
     public EndpointS3SCM(String prefix) {
         this.prefix = Util.fixEmptyAndTrim(prefix);
+        initTransientFields();
     }
 
     /**
-     * Returns legacy global S3 prefix.
+     * Reinitializes transient fields after XStream deserializes this object.
+     * XStream bypasses constructors, so inline initializers do not run —
+     * every transient service must be recreated here.
      *
-     * @return legacy global prefix, or null
+     * @return this SCM instance
      */
+    protected Object readResolve() {
+        initTransientFields();
+        return this;
+    }
+
+    private void initTransientFields() {
+        if (credentialLookup == null) credentialLookup = CredentialsHelper::lookupCredentialsForRun;
+        if (configValidator == null) configValidator = new EndpointS3SCMConfigValidator();
+        if (configResolver == null) configResolver = new CheckoutConfigResolver();
+        if (prefixResolver == null) prefixResolver = new PrefixResolver();
+        if (s3Service == null) s3Service = new S3Service();
+        if (zipService == null) zipService = new ZipService();
+        if (checksumVerifier == null) checksumVerifier = new ChecksumVerifier();
+        if (archiveDownloader == null)
+            archiveDownloader = new S3ArchiveDownloader(s3Service, configValidator, checksumVerifier);
+        if (workspaceExtractor == null)
+            workspaceExtractor = new WorkspaceExtractor(zipService);
+        if (pollingService == null)
+            pollingService = new S3PollingService(s3Service, configResolver, prefixResolver);
+    }
+
+    @Override
+    public EndpointS3SCMDescriptor getDescriptor() {
+        try {
+            return (EndpointS3SCMDescriptor) super.getDescriptor();
+        } catch (IllegalStateException e) {
+            return null;
+        }
+    }
+
     public String getPrefix() {
         return prefix;
     }
 
-    /**
-     * Returns configured S3 source locations.
-     *
-     * @return unmodifiable list of S3 locations
-     */
-    @NonNull
-    public List<S3Location> getLocations() {
-        return locations != null
-                ? Collections.unmodifiableList(locations)
-                : Collections.emptyList();
+    public String getTargetDirectory() {
+        return targetDirectory;
     }
 
     /**
-     * Sets S3 source locations.
+     * Sets optional target directory inside workspace.
      *
-     * <p>Locations are normalized by removing null entries and sorting by priority.</p>
-     *
-     * @param locations S3 locations
+     * @param targetDirectory target subdirectory, or blank for workspace root
      */
     @DataBoundSetter
-    public void setLocations(List<S3Location> locations) {
-        this.locations = locations == null
-                ? new ArrayList<>()
+    public void setTargetDirectory(String targetDirectory) {
+        this.targetDirectory = Util.fixEmptyAndTrim(targetDirectory);
+    }
+
+    @NonNull
+    public List<S3Location> getLocations() {
+        return locationsOverride != null
+                ? Collections.unmodifiableList(locationsOverride)
+                : Collections.emptyList();
+    }
+
+    void setLocations(List<S3Location> locations) {
+        this.locationsOverride = locations == null ? null
                 : locations.stream()
                 .filter(Objects::nonNull)
                 .sorted(Comparator.comparingInt(S3Location::getPriority))
                 .collect(Collectors.toCollection(ArrayList::new));
     }
 
-    public int getMaxRetries() {
-        return maxRetries;
+    void setCredentialLookup(BiFunction<Run<?, ?>, String, StandardUsernamePasswordCredentials> lookup) {
+        this.credentialLookup = lookup;
+    }
+
+    void setS3Service(S3Service s3Service) {
+        this.s3Service = s3Service;
+        rebuildServices();
+    }
+
+    void setZipService(ZipService zipService) {
+        this.zipService = zipService;
+        rebuildServices();
+    }
+
+    void setChecksumVerifier(ChecksumVerifier checksumVerifier) {
+        this.checksumVerifier = checksumVerifier;
+        rebuildServices();
     }
 
     /**
-     * Sets maximum number of download retry attempts.
-     *
-     * @param maxRetries maximum retry attempts
+     * Rebuilds composed services after tests replace dependencies.
      */
-    @DataBoundSetter
-    public void setMaxRetries(int maxRetries) {
-        this.maxRetries = Math.max(1, Math.min(maxRetries, 10));
+    private void rebuildServices() {
+        this.archiveDownloader = new S3ArchiveDownloader(s3Service, configValidator, checksumVerifier);
+        this.workspaceExtractor = new WorkspaceExtractor(zipService);
+        this.pollingService = new S3PollingService(s3Service, configResolver, prefixResolver);
     }
 
-    public int getRetryDelayMs() {
-        return retryDelayMs;
-    }
-
-    /**
-     * Sets retry delay in milliseconds.
-     *
-     * @param retryDelayMs retry delay in milliseconds
-     */
-    @DataBoundSetter
-    public void setRetryDelayMs(int retryDelayMs) {
-        this.retryDelayMs = Math.max(500, Math.min(retryDelayMs, 30000));
-    }
-
-    public boolean isStripTopLevelDir() {
-        return stripTopLevelDir;
-    }
-
-    /**
-     * Controls whether common top-level directory in ZIP archive should be stripped.
-     *
-     * @param stripTopLevelDir true to strip common top-level directory
-     */
-    @DataBoundSetter
-    public void setStripTopLevelDir(boolean stripTopLevelDir) {
-        this.stripTopLevelDir = stripTopLevelDir;
-    }
-
-    /**
-     * Performs Jenkins SCM checkout.
-     *
-     * @param build         current Jenkins build
-     * @param launcher      Jenkins launcher
-     * @param workspace     Jenkins workspace
-     * @param listener      build listener
-     * @param changelogFile changelog file, unused
-     * @param baseline      SCM revision baseline, unused
-     * @throws IOException if checkout fails
-     */
     @Override
     public void checkout(@NonNull Run<?, ?> build,
                          @NonNull Launcher launcher,
@@ -176,190 +190,110 @@ public class EndpointS3SCM extends SCM {
                          File changelogFile,
                          SCMRevisionState baseline) throws IOException {
 
-        configValidator.validate(this);
+        CheckoutConfig config = resolveAndValidateConfig(build);
 
-        PrintStream log = listener.getLogger();
+        // Suppress verbose logging and build actions for Jenkins-internal checkouts
+        // (@script = reading Jenkinsfile, @libs = loading shared library).
+        // Errors still surface via exceptions which Jenkins reports independently.
+        boolean silent = isSilentCheckout(workspace);
+        TaskListener effectiveListener = silent ? TaskListener.NULL : listener;
+        PrintStream log = effectiveListener.getLogger();
 
-        log.println(LOG_PREFIX + "Checkout from S3-compatible endpoint(s)");
-        log.println(LOG_PREFIX + "prefix is configured per S3 location");
-        log.printf(LOG_PREFIX + "maxRetries: %d, retryDelayMs: %dms%n", maxRetries, retryDelayMs);
-        log.printf(LOG_PREFIX + "stripTopLevelDir: %s%n", stripTopLevelDir);
+        PrefixResolver.ResolvedPrefix resolvedPrefix =
+                prefixResolver.resolve(build, prefix, effectiveListener);
+
+        if (!resolvedPrefix.expanded().equals(resolvedPrefix.original())) {
+            log.printf(LOG_PREFIX + "Expanded prefix: '%s' → '%s'%n",
+                    resolvedPrefix.original(), resolvedPrefix.expanded());
+        }
+
+        logCheckoutStart(config, log, resolvedPrefix);
 
         Path tempFile = null;
         boolean success = false;
-        List<String> errors = new ArrayList<>();
+        S3CheckoutAction checkoutAction = null;
 
         try {
-            tempFile = Files.createTempFile("endpoint-s3scm-", ".zip");
-
-            for (S3Location location : getLocations()) {
-                String effectivePrefix = effectivePrefix(location);
-
-                try {
-                    log.printf(
-                            LOG_PREFIX + "Trying source '%s': endpoint=%s, bucket=%s, prefix=%s, region=%s, priority=%d%n",
-                            safeLocationName(location),
-                            maskUrl(location.getEndpoint()),
-                            location.getBucket(),
-                            effectivePrefix,
-                            PluginUtils.resolveRegionId(location.getRegion()),
-                            location.getPriority()
-                    );
-
-                    S3ObjectCandidate downloadedObject =
-                            downloadLatestFromLocation(build, location, effectivePrefix, tempFile, listener);
-
-                    log.printf(
-                            LOG_PREFIX + "Download complete. Object='%s', size=%d bytes%n",
-                            downloadedObject.getKey(),
-                            Files.size(tempFile)
-                    );
-
-                    zipService.validateZipFile(tempFile, listener);
-
-                    workspace.mkdirs();
-                    workspace.deleteContents();
-
-                    log.println(LOG_PREFIX + "Extracting ZIP archive into workspace...");
-                    zipService.extractZipSecurely(tempFile, workspace, listener, stripTopLevelDir);
-
-                    log.printf(
-                            LOG_PREFIX + "Checkout finished successfully from source '%s'.%n",
-                            safeLocationName(location)
-                    );
-
-                    success = true;
-                    break;
-
-                } catch (Exception e) {
-                    String message = String.format(
-                            "Source '%s' failed: %s",
-                            safeLocationName(location),
-                            cleanErrorMessage(e)
-                    );
-
-                    errors.add(message);
-                    log.println(LOG_PREFIX + "ERROR: " + message);
-                }
-            }
-
-            if (!success) {
-                throw new AbortException(
-                        "All S3 sources failed:\n  - " + String.join("\n  - ", errors)
-                );
-            }
-
+            tempFile = createTempFile();
+            checkoutAction = checkoutFromAnyLocation(
+                    build, workspace, effectiveListener, config, tempFile, resolvedPrefix);
+            success = true;
         } catch (AbortException e) {
             throw e;
         } catch (Exception e) {
-            listener.error(LOG_PREFIX + "Checkout failed: " + cleanErrorMessage(e));
+            effectiveListener.error("Checkout failed: %s", cleanErrorMessage(e));
             throw new IOException("Failed to checkout from S3-compatible endpoint", e);
         } finally {
-            cleanup(tempFile, workspace, success, log);
+            workspaceExtractor.cleanup(tempFile, workspace, targetDirectory, success, log);
+        }
+
+        // Do not attach S3 Artifact action for internal (Jenkinsfile/library) checkouts —
+        // they would show up as spurious entries in the build sidebar.
+        if (build != null && checkoutAction != null && !silent) {
+            build.addAction(checkoutAction);
         }
     }
 
     /**
-     * Downloads latest ZIP archive from one S3 location.
+     * Returns {@code true} when the checkout is a Jenkins-internal operation —
+     * reading the Jenkinsfile ({@code @script}) or loading a shared library
+     * ({@code @libs}) — rather than an actual build-artifact checkout.
      *
-     * @param build    Jenkins build context
-     * @param location S3 source location
-     * @param prefix   prefix where ZIP archives are searched
-     * @param tempFile temporary target file
-     * @param listener Jenkins listener
-     * @return downloaded object metadata
-     * @throws AbortException       if checkout cannot continue
-     * @throws IOException          if S3 operation fails
-     * @throws InterruptedException if retry sleep is interrupted
+     * <p>Silent checkouts suppress all progress logging and do not attach an
+     * {@link S3CheckoutAction} to the build. Errors still propagate via exceptions
+     * and are displayed by Jenkins independently.</p>
      */
-    private S3ObjectCandidate downloadLatestFromLocation(@NonNull Run<?, ?> build,
-                                                         @NonNull S3Location location,
-                                                         @NonNull String prefix,
-                                                         @NonNull Path tempFile,
-                                                         @NonNull TaskListener listener)
-            throws IOException, AbortException, InterruptedException {
-
-        StandardUsernamePasswordCredentials credentials =
-                CredentialsHelper.lookupCredentialsForRun(build, location.getCredentialsId());
-
-        if (credentials == null) {
-            throw new AbortException("Cannot find credentials: " + location.getCredentialsId());
-        }
-
-        configValidator.validateCredentials(credentials);
-
-        try (S3Client s3 = s3Service.createClient(
-                location.getEndpoint(),
-                location.getRegion(),
-                credentials.getUsername(),
-                Secret.toString(credentials.getPassword())
-        )) {
-            PrintStream log = listener.getLogger();
-
-            log.printf(
-                    LOG_PREFIX + "Searching latest ZIP in bucket='%s', prefix='%s'%n",
-                    location.getBucket(),
-                    prefix
-            );
-
-            S3ObjectCandidate latest = s3Service.findLatestZipObject(s3, location.getBucket(), prefix);
-
-            if (latest == null) {
-                throw new AbortException("No ZIP files found in prefix: " + prefix);
-            }
-
-            log.printf(
-                    LOG_PREFIX + "Latest ZIP found: key='%s', size=%d bytes, lastModified=%s%n",
-                    latest.getKey(),
-                    latest.getSize(),
-                    latest.getLastModified()
-            );
-
-            if (latest.getSize() > LARGE_OBJECT_WARNING_SIZE) {
-                throw new AbortException(String.format(
-                        "Archive too large (%d bytes). Max: %d",
-                        latest.getSize(),
-                        LARGE_OBJECT_WARNING_SIZE
-                ));
-            }
-
-            Files.deleteIfExists(tempFile);
-
-            log.println(LOG_PREFIX + "Downloading object...");
-
-            s3Service.getObject(
-                    s3,
-                    location.getBucket(),
-                    latest.getKey(),
-                    tempFile,
-                    maxRetries,
-                    retryDelayMs,
-                    listener
-            );
-
-            return latest;
-
-        } catch (SdkException e) {
-            throw new IOException("S3 operation failed: " + cleanErrorMessage(e), e);
-        }
+    private static boolean isSilentCheckout(@NonNull FilePath workspace) {
+        String path = workspace.getRemote();
+        return path.contains("@script") || path.contains("@libs");
     }
 
     @Override
     public boolean supportsPolling() {
-        return false;
+        return true;
     }
 
-    /**
-     * Adds S3 configuration as build environment variables.
-     *
-     * @param build current build
-     * @param env   environment variables map
-     */
+    @Override
+    public SCMRevisionState calcRevisionsFromBuild(
+            @NonNull Run<?, ?> build,
+            @Nullable FilePath workspace,
+            @Nullable Launcher launcher,
+            @NonNull TaskListener listener) {
+
+        S3CheckoutAction action = build.getAction(S3CheckoutAction.class);
+
+        if (action == null) {
+            listener.getLogger().println(
+                    LOG_PREFIX + "No S3 checkout action found in build, cannot determine revision.");
+            return SCMRevisionState.NONE;
+        }
+
+        return new S3SCMRevisionState(action.getBucket(), action.getKey(), action.getLastModifiedMs());
+    }
+
+    @Override
+    public PollingResult compareRemoteRevisionWith(
+            @NonNull Job<?, ?> project,
+            @Nullable Launcher launcher,
+            @Nullable FilePath workspace,
+            @NonNull TaskListener listener,
+            @NonNull SCMRevisionState baseline) throws IOException {
+
+        return pollingService.compare(
+                project,
+                baseline,
+                listener,
+                prefix,
+                locationsOverride,
+                credentialLookup
+        );
+    }
+
     @Override
     public void buildEnvironment(@NonNull Run<?, ?> build, @NonNull Map<String, String> env) {
         env.put("ENDPOINT_S3_PREFIX", Objects.requireNonNullElse(prefix, ""));
 
-        List<S3Location> locs = getLocations();
+        List<S3Location> locs = resolveConfig(build).locations();
         env.put("ENDPOINT_S3_LOCATIONS_COUNT", String.valueOf(locs.size()));
 
         IntStream.range(0, locs.size()).forEach(i -> {
@@ -369,9 +303,8 @@ public class EndpointS3SCM extends SCM {
             env.put(envPrefix + "NAME", Objects.requireNonNullElse(location.getName(), ""));
             env.put(envPrefix + "ENDPOINT", Objects.requireNonNullElse(location.getEndpoint(), ""));
             env.put(envPrefix + "BUCKET", Objects.requireNonNullElse(location.getBucket(), ""));
-            env.put(envPrefix + "PREFIX", Objects.requireNonNullElse(effectivePrefix(location), ""));
+            env.put(envPrefix + "PREFIX", Objects.requireNonNullElse(prefix, ""));
             env.put(envPrefix + "REGION", Objects.requireNonNullElse(location.getRegion(), ""));
-            env.put(envPrefix + "CREDENTIALS_ID", Objects.requireNonNullElse(location.getCredentialsId(), ""));
             env.put(envPrefix + "PRIORITY", String.valueOf(location.getPriority()));
         });
     }
@@ -381,51 +314,143 @@ public class EndpointS3SCM extends SCM {
         return new NullChangeLogParser();
     }
 
-    @Override
-    public SCMRevisionState calcRevisionsFromBuild(
-            @NonNull Run<?, ?> build,
-            @Nullable FilePath workspace,
-            @Nullable Launcher launcher,
-            @NonNull TaskListener listener) {
-        return null;
+    private CheckoutConfig resolveAndValidateConfig(@NonNull Run<?, ?> build) throws AbortException {
+        CheckoutConfig config = resolveConfig(build);
+        configValidator.validate(prefix, config.locations());
+        return config;
     }
 
-    /**
-     * Resolves effective prefix for location.
-     *
-     * @param location S3 location
-     * @return location prefix or legacy global prefix
-     */
-    private String effectivePrefix(S3Location location) {
-        if (location != null && !isEmpty(location.getPrefix())) {
-            return location.getPrefix();
+    private CheckoutConfig resolveConfig(@Nullable Run<?, ?> build) {
+        return configResolver.resolve(build, locationsOverride);
+    }
+
+    private Path createTempFile() throws IOException {
+        return Files.createTempFile(TEMP_FILE_PREFIX, ZIP_FILE_SUFFIX);
+    }
+
+    private void logCheckoutStart(@NonNull CheckoutConfig config,
+                                  @NonNull PrintStream log,
+                                  @NonNull PrefixResolver.ResolvedPrefix resolvedPrefix) {
+        log.println(LOG_PREFIX + "Checkout from S3-compatible endpoint(s)");
+        log.printf(LOG_PREFIX + "prefix: %s%n",
+                resolvedPrefix.expanded().equals(resolvedPrefix.original())
+                        ? resolvedPrefix.original()
+                        : resolvedPrefix.original() + " → " + resolvedPrefix.expanded());
+        log.printf(LOG_PREFIX + "mode: %s%n",
+                resolvedPrefix.isExact() ? "EXACT ZIP" : "PREFIX (latest)");
+        log.printf(LOG_PREFIX + "maxRetries: %d, retryDelayMs: %dms%n",
+                config.maxRetries(), config.retryDelayMs());
+        log.printf(LOG_PREFIX + "stripTopLevelDir: %s%n", config.stripTopLevelDir());
+
+        if (targetDirectory != null) {
+            log.printf(LOG_PREFIX + "targetDirectory: %s%n", targetDirectory);
+        }
+    }
+
+    private S3CheckoutAction checkoutFromAnyLocation(@NonNull Run<?, ?> build,
+                                                     @NonNull FilePath workspace,
+                                                     @NonNull TaskListener listener,
+                                                     @NonNull CheckoutConfig config,
+                                                     @NonNull Path tempFile,
+                                                     @NonNull PrefixResolver.ResolvedPrefix resolvedPrefix)
+            throws IOException {
+
+        PrintStream log = listener.getLogger();
+        List<String> errors = new ArrayList<>();
+
+        for (S3Location location : config.locations()) {
+            try {
+                return checkoutFromLocation(
+                        build, workspace, listener, config, tempFile, location, resolvedPrefix);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Checkout interrupted", e);
+            } catch (Exception e) {
+                String message = String.format(
+                        "Source '%s' failed: %s",
+                        safeLocationName(location),
+                        cleanErrorMessage(e)
+                );
+                errors.add(message);
+                log.println(LOG_PREFIX + "ERROR: " + message);
+            }
         }
 
-        return prefix;
+        throw new AbortException(
+                "All S3 sources failed:\n  - " + String.join("\n  - ", errors)
+        );
     }
 
-    /**
-     * Returns human-readable location name for logs.
-     *
-     * @param location S3 location
-     * @return location name or bucket name
-     */
+    private S3CheckoutAction checkoutFromLocation(@NonNull Run<?, ?> build,
+                                                  @NonNull FilePath workspace,
+                                                  @NonNull TaskListener listener,
+                                                  @NonNull CheckoutConfig config,
+                                                  @NonNull Path tempFile,
+                                                  @NonNull S3Location location,
+                                                  @NonNull PrefixResolver.ResolvedPrefix resolvedPrefix)
+            throws IOException, InterruptedException {
+
+        PrintStream log = listener.getLogger();
+        logLocationAttempt(location, log, resolvedPrefix.expanded());
+
+        S3ObjectCandidate downloadedObject =
+                archiveDownloader.downloadLatest(
+                        build,
+                        location,
+                        resolvedPrefix.expanded(),
+                        tempFile,
+                        listener,
+                        config,
+                        credentialLookup
+                );
+
+        log.printf(
+                LOG_PREFIX + "Download complete. Object='%s', size=%d bytes%n",
+                downloadedObject.key(),
+                Files.size(tempFile)
+        );
+
+        workspaceExtractor.extract(tempFile, workspace, targetDirectory, listener, config);
+
+        log.printf(
+                LOG_PREFIX + "Checkout finished successfully from source '%s'.%n",
+                safeLocationName(location)
+        );
+
+        return new S3CheckoutAction(
+                downloadedObject.key(),
+                location.getBucket(),
+                safeLocationName(location),
+                downloadedObject.lastModified(),
+                downloadedObject.size(),
+                resolvedPrefix.mode()
+        );
+    }
+
+    private void logLocationAttempt(@NonNull S3Location location,
+                                    @NonNull PrintStream log,
+                                    @NonNull String expandedPrefix) {
+        log.printf(
+                LOG_PREFIX + "Trying source '%s': endpoint=%s, bucket=%s, prefix=%s, region=%s, priority=%d%n",
+                safeLocationName(location),
+                maskUrl(location.getEndpoint()),
+                location.getBucket(),
+                expandedPrefix,
+                resolveRegionId(location.getRegion()),
+                location.getPriority()
+        );
+    }
+
     private String safeLocationName(S3Location location) {
         if (location == null) {
             return "unknown";
         }
 
-        return !isEmpty(location.getName())
+        return location.getName() != null && !location.getName().isBlank()
                 ? location.getName()
                 : location.getBucket();
     }
 
-    /**
-     * Normalizes exception message for Jenkins build log output.
-     *
-     * @param e exception
-     * @return cleaned error message
-     */
     private String cleanErrorMessage(Exception e) {
         String message = e.getMessage();
 
@@ -434,34 +459,5 @@ public class EndpointS3SCM extends SCM {
         }
 
         return message.replace(LOG_PREFIX, "").trim();
-    }
-
-    /**
-     * Cleans temporary file and workspace after checkout.
-     *
-     * @param tempFile  temporary downloaded ZIP file
-     * @param workspace Jenkins workspace
-     * @param success   whether checkout completed successfully
-     * @param log       logger
-     */
-    private void cleanup(Path tempFile, FilePath workspace, boolean success, PrintStream log) {
-        if (tempFile != null) {
-            try {
-                Files.deleteIfExists(tempFile);
-            } catch (IOException e) {
-                log.printf(LOG_PREFIX + "Warning: cannot delete temp file: %s%n", e.getMessage());
-            }
-        }
-
-        if (!success) {
-            try {
-                if (workspace != null && workspace.exists()) {
-                    workspace.deleteContents();
-                    log.println(LOG_PREFIX + "Workspace cleaned up due to failed checkout.");
-                }
-            } catch (Exception e) {
-                log.printf(LOG_PREFIX + "Warning: cleanup failed: %s%n", e.getMessage());
-            }
-        }
     }
 }
