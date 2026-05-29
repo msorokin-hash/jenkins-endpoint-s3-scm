@@ -1,0 +1,37 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form" xmlns:st="jelly:stapler">
+    <style type="text/css">
+        .repeated-chunk__header {
+        background-color: #f8f9fa;
+        border-bottom: 1px solid #dcdcdc;
+        padding: 8px 15px !important;
+        font-weight: 600;
+        color: #333;
+        border-radius: 5px 5px 0 0;
+        }
+    </style>
+
+    <f:entry title="S3 locations">
+        <f:repeatable field="locations" add="Add S3 location" header="S3 Location" minimum="0">
+            <div class="jenkins-!-display-flex jenkins-!-flex-direction-column">
+                <st:include page="config.jelly" class="hudson.plugins.EndpointS3SCM.config.S3Location"/>
+            </div>
+        </f:repeatable>
+    </f:entry>
+
+    <f:advanced title="Checkout Settings">
+        <f:entry title="Skip checksum verification" field="skipChecksumVerification"
+                 description="By default the plugin looks for a .sha512 or .sha256 companion file next to each archive and verifies the hash. Enable this option to skip that check.">
+            <f:checkbox default="false"/>
+        </f:entry>
+        <f:entry title="Strip top-level directory" field="stripTopLevelDir">
+            <f:checkbox default="true"/>
+        </f:entry>
+        <f:entry title="Max retries" field="maxRetries">
+            <f:number default="3"/>
+        </f:entry>
+        <f:entry title="Retry delay (ms)" field="retryDelayMs">
+            <f:number default="1000"/>
+        </f:entry>
+    </f:advanced>
+</j:jelly>

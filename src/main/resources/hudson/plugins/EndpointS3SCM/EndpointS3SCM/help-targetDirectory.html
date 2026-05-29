@@ -1,0 +1,15 @@
+<div>
+    Optional subdirectory inside the workspace where the archive contents will be extracted.
+    <p>
+        Leave blank to extract directly into the workspace root.
+    </p>
+    <p>
+        When set, a subdirectory with this name is created (or cleared) inside the workspace,
+        and the archive is extracted there. For example, setting <code>libs</code> will place
+        all files under <code>$WORKSPACE/libs/</code>.
+    </p>
+    <p>
+        Jenkins environment variables (e.g. <code>$BUILD_NUMBER</code>) are not expanded here —
+        use a literal directory name.
+    </p>
+</div>

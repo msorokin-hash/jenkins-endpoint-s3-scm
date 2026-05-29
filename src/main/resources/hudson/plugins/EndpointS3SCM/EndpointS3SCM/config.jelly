@@ -1,35 +1,11 @@
 <?jelly escape-by-default='true'?>
-<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form" xmlns:st="jelly:stapler">
-    <style type="text/css">
-        .repeated-chunk__header {
-        background-color: #f8f9fa;
-        border-bottom: 1px solid #dcdcdc;
-        padding: 8px 15px !important;
-        font-weight: 600;
-        color: #333;
-        border-radius: 5px 5px 0 0;
-        }
-    </style>
-
+<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
     <f:section title="S3 Source Configuration">
-        <f:entry title="S3 locations">
-            <f:repeatable field="locations" add="Add S3 location" header="S3 Location" minimum="0">
-                <div class="jenkins-!-display-flex jenkins-!-flex-direction-column">
-                    <st:include page="config.jelly" class="${descriptor.clazz}"/>
-                </div>
-            </f:repeatable>
+        <f:entry title="Directory / Prefix" field="prefix">
+            <f:textbox class="jenkins-input"/>
         </f:entry>
-
-        <f:advanced title="Global Checkout Settings">
-            <f:entry title="Strip top-level directory" field="stripTopLevelDir">
-                <f:checkbox default="true"/>
-            </f:entry>
-            <f:entry title="Max retries" field="maxRetries">
-                <f:number default="3"/>
-            </f:entry>
-            <f:entry title="Retry delay (ms)" field="retryDelayMs">
-                <f:number default="1000"/>
-            </f:entry>
-        </f:advanced>
+        <f:entry title="Target directory" field="targetDirectory">
+            <f:textbox class="jenkins-input" placeholder="(workspace root)"/>
+        </f:entry>
     </f:section>
 </j:jelly>

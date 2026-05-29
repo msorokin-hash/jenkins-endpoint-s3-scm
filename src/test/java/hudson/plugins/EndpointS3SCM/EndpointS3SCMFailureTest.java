@@ -4,184 +4,168 @@ import com.cloudbees.plugins.credentials.CredentialsScope;
 import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl;
 import hudson.AbortException;
 import hudson.FilePath;
-import hudson.Launcher;
-import hudson.model.Run;
 import hudson.model.TaskListener;
+import hudson.plugins.EndpointS3SCM.checkout.ChecksumVerifier;
+import hudson.plugins.EndpointS3SCM.config.S3Location;
+import hudson.plugins.EndpointS3SCM.s3.S3ObjectCandidate;
+import hudson.plugins.EndpointS3SCM.support.FakeS3Service;
+import hudson.plugins.EndpointS3SCM.support.FakeZipService;
 import hudson.util.StreamTaskListener;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
-import org.mockito.MockedStatic;
-import org.mockito.Mockito;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import software.amazon.awssdk.core.exception.SdkException;
-import software.amazon.awssdk.services.s3.S3Client;
 
-import java.io.File;
-import java.lang.reflect.Field;
+import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Collections;
 
-import static hudson.plugins.EndpointS3SCM.EndpointS3SCM.LARGE_OBJECT_WARNING_SIZE;
+import static hudson.plugins.EndpointS3SCM.EndpointS3SCMConstants.MAX_ARCHIVE_SIZE_BYTES;
 import static org.junit.Assert.*;
-import static org.mockito.ArgumentMatchers.*;
-import static org.mockito.Mockito.*;
 
+@DisplayName("EndpointS3SCM — failure scenarios")
 public class EndpointS3SCMFailureTest {
 
-    @Rule
-    public TemporaryFolder temp = new TemporaryFolder();
+    @TempDir
+    Path tempDir;
 
     private TaskListener newListener() {
         return new StreamTaskListener(System.out, StandardCharsets.UTF_8);
     }
 
-    private UsernamePasswordCredentialsImpl newCreds() {
+    private UsernamePasswordCredentialsImpl creds() {
         return new UsernamePasswordCredentialsImpl(
-                CredentialsScope.SYSTEM,
-                "creds-id",
-                "desc",
-                "ACCESS_KEY",
-                "SECRET_KEY"
-        );
-    }
-
-    private void injectField(Object target, String fieldName, Object value) throws Exception {
-        Field f = EndpointS3SCM.class.getDeclaredField(fieldName);
-        f.setAccessible(true);
-        f.set(target, value);
+                CredentialsScope.SYSTEM, "creds-id", "desc", "ACCESS_KEY", "SECRET_KEY");
     }
 
     private EndpointS3SCM newScm() {
-        S3Location location = new S3Location();
-        location.setEndpoint("http://example.com");
-        location.setRegion("us-east-1");
-        location.setName("primary");
-        location.setBucket("bucket");
-        location.setCredentialsId("creds-id");
-        location.setPriority(10);
+        S3Location loc = new S3Location();
+        loc.setName("primary");
+        loc.setEndpoint("http://example.com");
+        loc.setBucket("bucket");
+        loc.setCredentialsId("creds-id");
+        loc.setPriority(10);
 
         EndpointS3SCM scm = new EndpointS3SCM("releases/");
-        scm.setLocations(Collections.singletonList(location));
-
+        scm.setLocations(Collections.singletonList(loc));
+        scm.setCredentialLookup((run, id) -> creds());
         return scm;
     }
 
+    private void wireServices(EndpointS3SCM scm, FakeS3Service s3, FakeZipService zip) {
+        scm.setS3Service(s3);
+        scm.setZipService(zip);
+        scm.setChecksumVerifier(new NoOpChecksumVerifier());
+    }
+
     @Test
+    @DisplayName("checkout: archive exceeds 1 GB — AbortException thrown, no download attempted")
     public void checkout_abortsWhenObjectTooLarge() throws Exception {
-        File wsDir = temp.newFolder("workspace");
-        FilePath workspace = new FilePath(wsDir);
+        Path wsDir = Files.createDirectory(tempDir.resolve("ws-large"));
+        FilePath workspace = new FilePath(wsDir.toFile());
 
-        Run<?, ?> run = mock(Run.class);
-        Launcher launcher = mock(Launcher.class);
-        TaskListener listener = newListener();
+        FakeS3Service s3 = new FakeS3Service();
+        s3.putLatest("bucket", "releases/", new S3ObjectCandidate(
+                "releases/huge.zip",
+                MAX_ARCHIVE_SIZE_BYTES + 1,
+                Instant.parse("2025-01-01T10:00:00Z")));
 
-        UsernamePasswordCredentialsImpl creds = newCreds();
+        EndpointS3SCM scm = newScm();
+        wireServices(scm, s3, new FakeZipService());
 
-        try (MockedStatic<CredentialsHelper> credsStatic =
-                     Mockito.mockStatic(CredentialsHelper.class)) {
+        try {
+            scm.checkout(null, null, workspace, newListener(), null, null);
+            fail("Expected AbortException due to large object size");
+        } catch (AbortException e) {
+            assertTrue(e.getMessage().contains("All S3 sources failed"));
+            assertTrue(e.getMessage().contains("Archive too large"));
+        }
 
-            credsStatic.when(() -> CredentialsHelper.lookupCredentialsForRun(run, "creds-id"))
-                    .thenReturn(creds);
+        assertEquals(1, s3.findLatestCallCount);
+        assertEquals(0, s3.getObjectCallCount);
+    }
 
-            S3Service s3ServiceMock = mock(S3Service.class);
-            ZipService zipServiceMock = mock(ZipService.class);
-            S3Client s3ClientMock = mock(S3Client.class);
+    @Test
+    @DisplayName("checkout: SdkException during download — AbortException thrown, workspace cleaned up")
+    public void checkout_s3SdkExceptionDuringDownload_abortsAndCleansWorkspace() throws Exception {
+        Path wsDir = Files.createDirectory(tempDir.resolve("ws-sdkfail"));
+        Path preexisting = wsDir.resolve("old.txt");
+        Files.writeString(preexisting, "old content");
+        assertTrue(preexisting.toFile().exists());
 
-            when(s3ServiceMock.createClient(
-                    eq("http://example.com"),
-                    any(),
-                    eq("ACCESS_KEY"),
-                    anyString()
-            )).thenReturn(s3ClientMock);
+        FilePath workspace = new FilePath(wsDir.toFile());
 
-            S3ObjectCandidate tooLargeObject = new S3ObjectCandidate(
-                    "releases/key.zip",
-                    LARGE_OBJECT_WARNING_SIZE + 1,
-                    Instant.parse("2025-01-01T10:00:00Z")
-            );
+        FakeS3Service s3 = new FakeS3Service();
+        s3.putLatest("bucket", "releases/",
+                FakeS3Service.candidate("releases/app.zip", 1024L));
+        s3.setGetObjectSdkException(SdkException.builder().message("boom").build());
 
-            when(s3ServiceMock.findLatestZipObject(
-                    s3ClientMock,
-                    "bucket",
-                    "releases/"
-            )).thenReturn(tooLargeObject);
+        EndpointS3SCM scm = newScm();
+        wireServices(scm, s3, new FakeZipService());
 
-            EndpointS3SCM scm = newScm();
+        try {
+            scm.checkout(null, null, workspace, newListener(), null, null);
+            fail("Expected AbortException");
+        } catch (AbortException e) {
+            assertTrue(e.getMessage().contains("All S3 sources failed"));
+            assertTrue(e.getMessage().contains("S3 operation failed"));
+            assertTrue(e.getMessage().contains("primary"));
+        }
 
-            injectField(scm, "s3Service", s3ServiceMock);
-            injectField(scm, "zipService", zipServiceMock);
+        assertFalse("Workspace must be cleaned up after failed checkout", preexisting.toFile().exists());
+    }
 
-            try {
-                scm.checkout(run, launcher, workspace, listener, null, null);
-                fail("Expected AbortException due to large object size");
-            } catch (AbortException e) {
-                // ПРОВЕРКА: Новые тексты сообщений
-                assertTrue(e.getMessage().contains("All S3 sources failed"));
-                assertTrue(e.getMessage().contains("Archive too large"));
-            }
+    @Test
+    @DisplayName("checkout: no ZIP in prefix — AbortException with 'No ZIP files found'")
+    public void checkout_noZipObjectFound_abortsWithMessage() throws Exception {
+        Path wsDir = Files.createDirectory(tempDir.resolve("ws-nozip"));
+        FilePath workspace = new FilePath(wsDir.toFile());
 
-            verify(s3ServiceMock, times(1))
-                    .findLatestZipObject(s3ClientMock, "bucket", "releases/");
+        FakeS3Service s3 = new FakeS3Service();
+
+        EndpointS3SCM scm = newScm();
+        wireServices(scm, s3, new FakeZipService());
+
+        try {
+            scm.checkout(null, null, workspace, newListener(), null, null);
+            fail("Expected AbortException");
+        } catch (AbortException e) {
+            assertTrue(e.getMessage().contains("All S3 sources failed"));
+            assertTrue(e.getMessage().contains("No ZIP files found"));
         }
     }
 
     @Test
-    public void checkout_s3ServiceThrowsSdkException_resultsInAbortExceptionAndWorkspaceCleanup() throws Exception {
-        File wsDir = temp.newFolder("workspace2");
-        File preexisting = new File(wsDir, "old.txt");
-        Files.writeString(preexisting.toPath(), "old content");
-        assertTrue(preexisting.exists());
+    @DisplayName("checkout: null credentials — AbortException with 'All S3 sources failed'")
+    public void checkout_credentialsNotFound_abortsWithMessage() throws Exception {
+        Path wsDir = Files.createDirectory(tempDir.resolve("ws-nocreds"));
+        FilePath workspace = new FilePath(wsDir.toFile());
 
-        FilePath workspace = new FilePath(wsDir);
+        FakeS3Service s3 = new FakeS3Service();
+        s3.putLatest("bucket", "releases/", FakeS3Service.candidate("releases/app.zip", 1024L));
 
-        Run<?, ?> run = mock(Run.class);
-        Launcher launcher = mock(Launcher.class);
-        TaskListener listener = newListener();
+        EndpointS3SCM scm = newScm();
+        scm.setCredentialLookup((run, id) -> null);
+        scm.setS3Service(s3);
+        scm.setZipService(new FakeZipService());
+        scm.setChecksumVerifier(new NoOpChecksumVerifier());
 
-        UsernamePasswordCredentialsImpl creds = newCreds();
+        try {
+            scm.checkout(null, null, workspace, newListener(), null, null);
+            fail("Expected AbortException");
+        } catch (AbortException e) {
+            assertTrue(e.getMessage().contains("All S3 sources failed"));
+        }
+    }
 
-        try (MockedStatic<CredentialsHelper> credsStatic =
-                     Mockito.mockStatic(CredentialsHelper.class)) {
-
-            credsStatic.when(() -> CredentialsHelper.lookupCredentialsForRun(run, "creds-id"))
-                    .thenReturn(creds);
-
-            S3Service s3ServiceMock = mock(S3Service.class);
-            ZipService zipServiceMock = mock(ZipService.class);
-            S3Client s3ClientMock = mock(S3Client.class);
-
-            when(s3ServiceMock.createClient(anyString(), any(), anyString(), anyString()))
-                    .thenReturn(s3ClientMock);
-
-            S3ObjectCandidate latestObject = new S3ObjectCandidate(
-                    "releases/key.zip",
-                    1024L,
-                    Instant.parse("2025-01-01T10:00:00Z")
-            );
-
-            when(s3ServiceMock.findLatestZipObject(s3ClientMock, "bucket", "releases/"))
-                    .thenReturn(latestObject);
-
-            doThrow(SdkException.builder().message("boom").build())
-                    .when(s3ServiceMock)
-                    .getObject(any(), anyString(), anyString(), any(), anyInt(), anyInt(), any());
-
-            EndpointS3SCM scm = newScm();
-            injectField(scm, "s3Service", s3ServiceMock);
-            injectField(scm, "zipService", zipServiceMock);
-
-            try {
-                scm.checkout(run, launcher, workspace, listener, null, null);
-                fail("Expected AbortException");
-            } catch (AbortException e) {
-                assertTrue(e.getMessage().contains("All S3 sources failed"));
-                assertTrue(e.getMessage().contains("S3 operation failed"));
-                assertTrue(e.getMessage().contains("primary"));
-            }
-
-            assertFalse("Workspace must be cleaned up after failed checkout", preexisting.exists());
+    private static class NoOpChecksumVerifier extends ChecksumVerifier {
+        @Override
+        public void verify(software.amazon.awssdk.services.s3.S3Client s3,
+                           hudson.plugins.EndpointS3SCM.s3.S3Service s3Service, String bucket, String zipKey,
+                           Path zipFile, PrintStream log) {
         }
     }
 }

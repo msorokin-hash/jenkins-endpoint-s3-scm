@@ -1,0 +1,32 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core">
+    <table style="border-collapse:collapse;margin:0.4em 0;font-size:0.9em">
+        <tr style="background:#1f2933;color:#e5e7eb">
+            <td colspan="2" style="padding:5px 12px;font-weight:600">S3 Artifact</td>
+        </tr>
+        <tr>
+            <td style="padding:3px 12px;font-weight:600;white-space:nowrap">Key</td>
+            <td style="padding:3px 12px;font-family:monospace">${it.key}</td>
+        </tr>
+        <tr style="background:#f9fafb">
+            <td style="padding:3px 12px;font-weight:600">Bucket</td>
+            <td style="padding:3px 12px">${it.bucket}</td>
+        </tr>
+        <tr>
+            <td style="padding:3px 12px;font-weight:600">Source</td>
+            <td style="padding:3px 12px">${it.sourceName}</td>
+        </tr>
+        <tr style="background:#f9fafb">
+            <td style="padding:3px 12px;font-weight:600;white-space:nowrap">Last Modified</td>
+            <td style="padding:3px 12px">${it.lastModifiedForDisplay}</td>
+        </tr>
+        <tr>
+            <td style="padding:3px 12px;font-weight:600">Size</td>
+            <td style="padding:3px 12px">${it.formattedSize}</td>
+        </tr>
+        <tr style="background:#f9fafb">
+            <td style="padding:3px 12px;font-weight:600">Mode</td>
+            <td style="padding:3px 12px">${it.mode}</td>
+        </tr>
+    </table>
+</j:jelly>
